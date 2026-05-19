@@ -23,7 +23,7 @@ import {
   type WriteTextFileResponse,
   type ClientCapabilities,
 } from '@agentclientprotocol/sdk';
-import { execute, type AmpOptions, type StreamMessage } from '@ampcode/sdk';
+import { execute, threads, type AmpOptions, type StreamMessage } from '@ampcode/sdk';
 
 type AssistantStopReason = 'end_turn' | 'tool_use' | 'max_tokens' | null;
 type AcpStopReason = 'end_turn' | 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled';
@@ -49,6 +49,15 @@ export type AmpMode = (typeof AMP_MODES)[number];
 
 const AMP_ACP_THINKING_ENV = 'AMP_ACP_THINKING';
 const AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV = 'AMP_ACP_DANGEROUSLY_ALLOW_ALL';
+const AMP_ACP_SYSTEM_PROMPT_ENV = 'AMP_ACP_SYSTEM_PROMPT';
+const AMP_ACP_TOOLBOX_ENV = 'AMP_ACP_TOOLBOX';
+const AMP_ACP_SKILLS_ENV = 'AMP_ACP_SKILLS';
+const AMP_ACP_SETTINGS_FILE_ENV = 'AMP_ACP_SETTINGS_FILE';
+const AMP_ACP_LOG_LEVEL_ENV = 'AMP_ACP_LOG_LEVEL';
+const AMP_ACP_LOG_FILE_ENV = 'AMP_ACP_LOG_FILE';
+
+const AMP_LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'audit'] as const;
+type AmpLogLevel = (typeof AMP_LOG_LEVELS)[number];
 
 // Work around @ampcode/sdk@0.1.0-2026-05-19 + @ampcode/cli@0.0.1779181266 mismatch:
 // the SDK's resolveLocalAmpPackageCommand() runs `node <bin/amp.exe>`, but the new
@@ -71,6 +80,15 @@ if (!process.env.AMP_CLI_PATH) {
   }
 }
 
+export interface UsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  durationMs: number;
+  numTurns: number;
+}
+
 interface SessionState {
   threadId: string | null;
   controller: AbortController | null;
@@ -79,6 +97,8 @@ interface SessionState {
   mode: AmpMode;
   mcpConfig: AmpMcpConfig;
   cwd: string;
+  lastUsage: UsageSnapshot | null;
+  mcpStatusReported: Map<string, string>;
 }
 
 export interface AmpOptionsInput {
@@ -166,6 +186,8 @@ export class AmpAcpAgent implements Agent {
       mode: 'smart',
       mcpConfig,
       cwd: params.cwd || process.cwd(),
+      lastUsage: null,
+      mcpStatusReported: new Map(),
     });
 
     const result: NewSessionResponse = {
@@ -206,6 +228,18 @@ export class AmpAcpAgent implements Agent {
       }
     }
 
+    const slash = detectAdapterSlashCommand(textInput);
+    if (slash) {
+      try {
+        await this.handleAdapterSlashCommand(params.sessionId, s, slash);
+      } finally {
+        s.active = false;
+        s.cancelled = false;
+        s.controller = null;
+      }
+      return { stopReason: 'end_turn' };
+    }
+
     const options = buildAmpOptions({
       cwd: s.cwd,
       mode: s.mode,
@@ -218,6 +252,12 @@ export class AmpAcpAgent implements Agent {
 
     let lastAssistantStopReason: AssistantStopReason = null;
     let lastResult: StreamMessage | null = null;
+    let pendingAssistantUsage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_creation_input_tokens?: number;
+      cache_read_input_tokens?: number;
+    } | undefined;
 
     try {
       for await (const message of execute({ prompt: textInput, options, signal: controller.signal })) {
@@ -228,8 +268,15 @@ export class AmpAcpAgent implements Agent {
 
         this.appendToSessionLog(params.sessionId, message);
 
+        if (message.type === 'system' && message.subtype === 'init') {
+          await this.surfaceMcpStatus(params.sessionId, s, message.mcp_servers);
+        }
+
         if (message.type === 'assistant') {
           lastAssistantStopReason = message.message?.stop_reason ?? lastAssistantStopReason;
+          // Usage actually lives on assistant.message.usage, NOT on result.usage —
+          // despite what the SDK type claims. Capture as we see it, finalize on result.
+          if (message.message?.usage) pendingAssistantUsage = message.message.usage;
           for (const n of toAcpNotifications(message, params.sessionId)) {
             try {
               await this.client.sessionUpdate(n);
@@ -249,6 +296,16 @@ export class AmpAcpAgent implements Agent {
 
         if (message.type === 'result') {
           lastResult = message;
+          if (pendingAssistantUsage) {
+            s.lastUsage = {
+              inputTokens: pendingAssistantUsage.input_tokens,
+              outputTokens: pendingAssistantUsage.output_tokens,
+              cacheCreationInputTokens: pendingAssistantUsage.cache_creation_input_tokens,
+              cacheReadInputTokens: pendingAssistantUsage.cache_read_input_tokens,
+              durationMs: message.duration_ms,
+              numTurns: message.num_turns,
+            };
+          }
           if (message.is_error) {
             if (typeof message.error === 'string' && isAuthError(message.error)) {
               console.error('[amp] Auth error in result, requesting authentication:', message.error);
@@ -328,6 +385,8 @@ export class AmpAcpAgent implements Agent {
       mode,
       mcpConfig,
       cwd: params.cwd || process.cwd(),
+      lastUsage: null,
+      mcpStatusReported: new Map(),
     });
     // Refresh lastUsedMs so this session isn't evicted while it's actively used.
     recordSession(this.storePaths, params.sessionId, { threadId: entry.threadId, mode });
@@ -381,15 +440,97 @@ export class AmpAcpAgent implements Agent {
         update: {
           sessionUpdate: 'available_commands_update',
           availableCommands: [
+            { name: 'init', description: 'Generate an AGENTS.md file for the project' },
+            { name: 'export', description: 'Export the current Amp thread as markdown' },
+            { name: 'usage', description: 'Show token usage for the latest turn' },
             {
-              name: 'init',
-              description: 'Generate an AGENTS.md file for the project',
+              name: 'resume',
+              description: 'Switch this session to an existing Amp thread by ID',
+              input: { hint: 'thread ID (e.g. T-019e...)' },
             },
           ],
         },
       });
     } catch (e) {
       console.error('[acp] failed to send available_commands_update', e);
+    }
+  }
+
+  private async handleAdapterSlashCommand(
+    sessionId: string,
+    s: SessionState,
+    slash: { command: string; arg: string },
+  ): Promise<void> {
+    const emit = async (text: string): Promise<void> => {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+      });
+    };
+    switch (slash.command) {
+      case 'export': {
+        if (!s.threadId) {
+          await emit('[/export] No active Amp thread yet. Send a regular prompt first.');
+          return;
+        }
+        try {
+          const md = await threads.markdown({ threadId: s.threadId });
+          await emit(md);
+        } catch (e) {
+          await emit(`[/export] Failed to export thread: ${(e as Error).message}`);
+        }
+        return;
+      }
+      case 'usage': {
+        await emit(formatUsage(s.lastUsage));
+        return;
+      }
+      case 'resume': {
+        const arg = slash.arg;
+        if (!arg) {
+          await emit('[/resume] Usage: `/resume <thread-id>` (e.g. `/resume T-019e...`).');
+          return;
+        }
+        if (!/^T-[A-Za-z0-9-]+$/.test(arg)) {
+          await emit(`[/resume] Refusing to switch: "${arg}" doesn't look like an Amp thread ID (expected T-…).`);
+          return;
+        }
+        s.threadId = arg;
+        s.lastUsage = null;
+        s.mcpStatusReported.clear();
+        this.persistSessionEntry(sessionId, s);
+        await emit(`[/resume] Switched session to Amp thread \`${arg}\`. Future prompts will continue that thread.`);
+        return;
+      }
+      default:
+        await emit(`[amp-acp] Unknown adapter command: /${slash.command}`);
+    }
+  }
+
+  private async surfaceMcpStatus(
+    sessionId: string,
+    s: SessionState,
+    servers: { name: string; status: string }[],
+  ): Promise<void> {
+    for (const server of servers) {
+      if (server.status === 'connected') {
+        s.mcpStatusReported.set(server.name, server.status);
+        continue;
+      }
+      const previously = s.mcpStatusReported.get(server.name);
+      if (previously === server.status) continue;
+      s.mcpStatusReported.set(server.name, server.status);
+      try {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `[amp-acp] MCP server "${server.name}" status: ${server.status}` },
+          },
+        });
+      } catch (e) {
+        console.error('[acp] failed to send MCP status notice', e);
+      }
     }
   }
 
@@ -430,7 +571,57 @@ export function buildAmpOptions(
     options.dangerouslyAllowAll = true;
   }
 
+  const systemPrompt = env[AMP_ACP_SYSTEM_PROMPT_ENV]?.trim();
+  if (systemPrompt) options.systemPrompt = systemPrompt;
+
+  const toolbox = env[AMP_ACP_TOOLBOX_ENV]?.trim();
+  if (toolbox) options.toolbox = toolbox;
+
+  const skills = env[AMP_ACP_SKILLS_ENV]?.trim();
+  if (skills) options.skills = skills;
+
+  const settingsFile = env[AMP_ACP_SETTINGS_FILE_ENV]?.trim();
+  if (settingsFile) options.settingsFile = settingsFile;
+
+  const logLevel = env[AMP_ACP_LOG_LEVEL_ENV]?.trim();
+  if (logLevel && (AMP_LOG_LEVELS as readonly string[]).includes(logLevel)) {
+    options.logLevel = logLevel as AmpLogLevel;
+  } else if (logLevel) {
+    console.warn(`[amp-acp] Ignoring AMP_ACP_LOG_LEVEL=${logLevel} — expected one of ${AMP_LOG_LEVELS.join('|')}`);
+  }
+
+  const logFile = env[AMP_ACP_LOG_FILE_ENV]?.trim();
+  if (logFile) options.logFile = logFile;
+
   return options;
+}
+
+export function detectAdapterSlashCommand(text: string): { command: string; arg: string } | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const match = /^\/([a-zA-Z][a-zA-Z0-9_-]*)(?:\s+([\s\S]*))?$/.exec(trimmed);
+  if (!match) return null;
+  const command = match[1];
+  // /init is intentionally NOT an adapter command — parsePrompt expands it into a
+  // regular prompt the model handles. Only commands that should bypass Amp belong
+  // here.
+  if (command !== 'export' && command !== 'usage' && command !== 'resume') return null;
+  return { command, arg: (match[2] ?? '').trim() };
+}
+
+export function formatUsage(usage: UsageSnapshot | null): string {
+  if (!usage) return '[/usage] No usage data yet — this session has not completed a turn.';
+  const fmt = (n: number): string => n.toLocaleString();
+  const lines = [
+    '**Usage (latest turn)**',
+    `- Input: ${fmt(usage.inputTokens)} tokens`,
+    `- Output: ${fmt(usage.outputTokens)} tokens`,
+  ];
+  if (usage.cacheReadInputTokens !== undefined) lines.push(`- Cache read: ${fmt(usage.cacheReadInputTokens)} tokens`);
+  if (usage.cacheCreationInputTokens !== undefined) lines.push(`- Cache write: ${fmt(usage.cacheCreationInputTokens)} tokens`);
+  lines.push(`- Duration: ${(usage.durationMs / 1000).toFixed(2)}s`);
+  lines.push(`- Turns: ${fmt(usage.numTurns)}`);
+  return lines.join('\n');
 }
 
 const INIT_PROMPT = `Please analyze this codebase and create an AGENTS.md file containing:
