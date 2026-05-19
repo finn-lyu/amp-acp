@@ -63,7 +63,9 @@ function sendAndWait(
 
 describe('Binary integration tests', () => {
   beforeAll(() => {
+    const { AMP_API_KEY: _ampApiKey, ...env } = process.env;
     proc = spawn(BINARY_PATH, [], {
+      env,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
 
@@ -100,7 +102,7 @@ describe('Binary integration tests', () => {
     expect(agentInfo.name).toBe('amp-acp');
     expect(agentInfo.version).toBeDefined();
     const caps = resp.result!.agentCapabilities as Record<string, Record<string, boolean>>;
-    expect(caps.promptCapabilities.image).toBe(true);
+    expect(caps.promptCapabilities.image).toBeUndefined();
     expect(caps.promptCapabilities.embeddedContext).toBe(true);
     expect(caps.mcpCapabilities.http).toBe(true);
     expect(caps.mcpCapabilities.sse).toBe(true);

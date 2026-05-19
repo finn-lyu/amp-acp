@@ -44,7 +44,7 @@ describe('ACP Protocol End-to-End', () => {
     expect(response.protocolVersion).toBe(1);
     expect(response.agentInfo?.name).toBe('amp-acp');
     expect(response.agentInfo?.version).toBeDefined();
-    expect(response.agentCapabilities?.promptCapabilities?.image).toBe(true);
+    expect(response.agentCapabilities?.promptCapabilities?.image).toBeUndefined();
     expect(response.agentCapabilities?.promptCapabilities?.embeddedContext).toBe(true);
     expect(response.agentCapabilities?.mcpCapabilities?.http).toBe(true);
     expect(response.agentCapabilities?.mcpCapabilities?.sse).toBe(true);

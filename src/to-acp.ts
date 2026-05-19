@@ -46,12 +46,15 @@ interface AmpMessage {
 
 export function toAcpNotifications(message: AmpMessage, sessionId: string): SessionNotification[] {
   const content = message.message?.content;
+  const isUser = message.type === 'user';
   if (typeof content === 'string') {
+    // Skip echoed user-prompt strings — the client originated them.
+    if (isUser) return [];
     return [
       {
         sessionId,
         update: {
-          sessionUpdate: message.type === 'assistant' ? 'agent_message_chunk' : 'user_message_chunk',
+          sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: content } as ContentBlock,
         },
       },
@@ -60,6 +63,9 @@ export function toAcpNotifications(message: AmpMessage, sessionId: string): Sess
   const output: SessionNotification[] = [];
   if (!Array.isArray(content)) return output;
   for (const chunk of content) {
+    // For user messages, only tool_result blocks carry information the client
+    // hasn't already seen. Everything else (echoed text, etc.) is dropped.
+    if (isUser && chunk.type !== 'tool_result') continue;
     let update: SessionNotification['update'] | null = null;
     switch (chunk.type) {
       case 'text':

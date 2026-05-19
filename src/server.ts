@@ -22,6 +22,9 @@ import {
   type ClientCapabilities,
 } from '@agentclientprotocol/sdk';
 import { execute, type AmpOptions, type StreamMessage } from '@ampcode/sdk';
+
+type AssistantStopReason = 'end_turn' | 'tool_use' | 'max_tokens' | null;
+type AcpStopReason = 'end_turn' | 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled';
 import { convertAcpMcpServersToAmpConfig, type AmpMcpConfig } from './mcp-config.js';
 import { toAcpNotifications } from './to-acp.js';
 import path from 'node:path';
@@ -103,7 +106,10 @@ export class AmpAcpAgent implements Agent {
         version: PACKAGE_VERSION,
       },
       agentCapabilities: {
-        promptCapabilities: { image: true, embeddedContext: true },
+        // image is intentionally omitted: @ampcode/sdk's ExecuteOptions.prompt only
+        // accepts string | AsyncIterable<UserInputMessage>, and UserInputMessage
+        // content is text-only. Advertising image:true would be a false promise.
+        promptCapabilities: { embeddedContext: true },
         mcpCapabilities: { http: true, sse: true },
       },
       authMethods: [
@@ -185,35 +191,16 @@ export class AmpAcpAgent implements Agent {
     s.cancelled = false;
     s.active = true;
 
-    let textInput = '';
-    for (const chunk of params.prompt) {
-      switch (chunk.type) {
-        case 'text':
-          if (chunk.text.trim() === '/init') {
-            textInput += `Please analyze this codebase and create an AGENTS.md file containing:
-1. Build/lint/test commands - especially for running a single test
-2. Architecture and codebase structure information, including important subprojects, internal APIs, databases, etc.
-3. Code style guidelines, including imports, conventions, formatting, types, naming conventions, error handling, etc.
+    const { text: textInput, warnings } = parsePrompt(params.prompt);
 
-The file you create will be given to agentic coding tools (such as yourself) that operate in this repository. Make it about 20 lines long.
-
-If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLAUDE.md), Windsurf rules (.windsurfrules), Cline rules (.clinerules), Goose rules (.goosehints), or Copilot rules (in .github/copilot-instructions.md), make sure to include them. Also, first check if there is an existing AGENTS.md or AGENT.md file, and if so, update it instead of overwriting it.`;
-          } else {
-            textInput += chunk.text;
-          }
-          break;
-        case 'resource_link':
-          textInput += `\n${chunk.uri}\n`;
-          break;
-        case 'resource':
-          if ('text' in chunk.resource) {
-            textInput += `\n<context ref="${chunk.resource.uri}">\n${chunk.resource.text}\n</context>\n`;
-          }
-          break;
-        case 'image':
-          break;
-        default:
-          break;
+    for (const text of warnings) {
+      try {
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+        });
+      } catch (e) {
+        console.error('[acp] failed to send warning chunk', e);
       }
     }
 
@@ -227,6 +214,9 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLA
     const controller = new AbortController();
     s.controller = controller;
 
+    let lastAssistantStopReason: AssistantStopReason = null;
+    let lastResult: StreamMessage | null = null;
+
     try {
       for await (const message of execute({ prompt: textInput, options, signal: controller.signal })) {
         if (!s.threadId && message.session_id) {
@@ -234,6 +224,15 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLA
         }
 
         if (message.type === 'assistant') {
+          lastAssistantStopReason = message.message?.stop_reason ?? lastAssistantStopReason;
+          for (const n of toAcpNotifications(message, params.sessionId)) {
+            try {
+              await this.client.sessionUpdate(n);
+            } catch (e) {
+              console.error('[acp] sessionUpdate failed', e);
+            }
+          }
+        } else if (message.type === 'user') {
           for (const n of toAcpNotifications(message, params.sessionId)) {
             try {
               await this.client.sessionUpdate(n);
@@ -243,19 +242,22 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLA
           }
         }
 
-        if (message.type === 'result' && message.is_error) {
-          if (typeof message.error === 'string' && isAuthError(message.error)) {
-            console.error('[amp] Auth error in result, requesting authentication:', message.error);
-            throw RequestError.authRequired();
+        if (message.type === 'result') {
+          lastResult = message;
+          if (message.is_error) {
+            if (typeof message.error === 'string' && isAuthError(message.error)) {
+              console.error('[amp] Auth error in result, requesting authentication:', message.error);
+              throw RequestError.authRequired();
+            }
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Error: ${message.error}` } },
+            });
           }
-          await this.client.sessionUpdate({
-            sessionId: params.sessionId,
-            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Error: ${message.error}` } },
-          });
         }
       }
 
-      return { stopReason: s.cancelled ? 'cancelled' : 'end_turn' };
+      return { stopReason: mapStopReason({ cancelled: s.cancelled, result: lastResult, lastAssistantStopReason }) };
     } catch (err) {
       if (s.cancelled || (err instanceof Error && (err.name === 'AbortError' || err.message.includes('aborted')))) {
         return { stopReason: 'cancelled' };
@@ -335,6 +337,59 @@ export function buildAmpOptions(
   }
 
   return options;
+}
+
+const INIT_PROMPT = `Please analyze this codebase and create an AGENTS.md file containing:
+1. Build/lint/test commands - especially for running a single test
+2. Architecture and codebase structure information, including important subprojects, internal APIs, databases, etc.
+3. Code style guidelines, including imports, conventions, formatting, types, naming conventions, error handling, etc.
+
+The file you create will be given to agentic coding tools (such as yourself) that operate in this repository. Make it about 20 lines long.
+
+If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLAUDE.md), Windsurf rules (.windsurfrules), Cline rules (.clinerules), Goose rules (.goosehints), or Copilot rules (in .github/copilot-instructions.md), make sure to include them. Also, first check if there is an existing AGENTS.md or AGENT.md file, and if so, update it instead of overwriting it.`;
+
+export function parsePrompt(prompt: PromptRequest['prompt']): { text: string; warnings: string[] } {
+  let text = '';
+  const warnings: string[] = [];
+  for (const chunk of prompt) {
+    switch (chunk.type) {
+      case 'text':
+        text += chunk.text.trim() === '/init' ? INIT_PROMPT : chunk.text;
+        break;
+      case 'resource_link':
+        text += `\n${chunk.uri}\n`;
+        break;
+      case 'resource':
+        if ('text' in chunk.resource) {
+          text += `\n<context ref="${chunk.resource.uri}">\n${chunk.resource.text}\n</context>\n`;
+        } else {
+          const mime = 'mimeType' in chunk.resource && chunk.resource.mimeType ? chunk.resource.mimeType : 'unknown mime';
+          warnings.push(`[amp-acp] Dropped binary attachment "${chunk.resource.uri}" (${mime}) — @ampcode/sdk only accepts text input.`);
+        }
+        break;
+      case 'image':
+        warnings.push('[amp-acp] Image attachments are not supported by @ampcode/sdk (text-only input). Dropped.');
+        break;
+      default:
+        break;
+    }
+  }
+  return { text, warnings };
+}
+
+export function mapStopReason(
+  args: { cancelled: boolean; result: StreamMessage | null; lastAssistantStopReason: AssistantStopReason },
+): AcpStopReason {
+  if (args.cancelled) return 'cancelled';
+  const r = args.result;
+  if (r && r.type === 'result') {
+    if (r.is_error && r.subtype === 'error_max_turns') return 'max_turn_requests';
+    // error_during_execution (and any other future error subtype) falls through to
+    // end_turn: the error text has already been streamed as an agent_message_chunk,
+    // and ACP's 'refusal' is reserved for model-side refusals, not runtime errors.
+  }
+  if (args.lastAssistantStopReason === 'max_tokens') return 'max_tokens';
+  return 'end_turn';
 }
 
 export function isAuthError(message: string): boolean {
