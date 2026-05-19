@@ -4,7 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { ClientSideConnection, AgentSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import { AmpAcpAgent } from './server.js';
+import { AmpAcpAgent, type AmpUsageCommandResult } from './server.js';
 import { recordSession, appendLogEntry, type SessionStorePaths } from './session-store.js';
 
 class TestClient {
@@ -19,12 +19,17 @@ function makeConnection(storePaths: SessionStorePaths) {
   const clientToAgent = new TransformStream();
   const agentToClient = new TransformStream();
   const testClient = new TestClient();
+  const usageRunner = async (): Promise<AmpUsageCommandResult> => ({
+    stdout: 'Balance: $42.00\nToday: $0.25',
+    stderr: '',
+    exitCode: 0,
+  });
   const conn = new ClientSideConnection(
     () => testClient,
     ndJsonStream(clientToAgent.writable, agentToClient.readable),
   );
   new AgentSideConnection(
-    (client) => new AmpAcpAgent(client, storePaths),
+    (client) => new AmpAcpAgent(client, storePaths, { usageRunner }),
     ndJsonStream(agentToClient.writable, clientToAgent.readable),
   );
   return { conn, testClient };
@@ -113,6 +118,63 @@ describe('loadSession', () => {
         expect.objectContaining({ sessionUpdate: 'available_commands_update' }),
       ]),
     );
+  });
+
+  it('hydrates latest usage from the per-session log for /usage after restore', async () => {
+    recordSession(store.paths, 'S-usage', { threadId: 'T-usage', mode: 'smart', lastUsedMs: Date.now() });
+    appendLogEntry(store.paths, 'S-usage', {
+      type: 'assistant',
+      session_id: 'T-usage',
+      message: {
+        content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { path: '/file.ts' } }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 100,
+          cache_creation_input_tokens: 5,
+          cache_read_input_tokens: 50,
+        },
+      },
+    });
+    appendLogEntry(store.paths, 'S-usage', {
+      type: 'assistant',
+      session_id: 'T-usage',
+      message: {
+        content: [{ type: 'text', text: 'done' }],
+        usage: {
+          input_tokens: 6,
+          output_tokens: 25,
+          cache_creation_input_tokens: 2,
+          cache_read_input_tokens: 10,
+        },
+      },
+    });
+    appendLogEntry(store.paths, 'S-usage', {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      duration_ms: 1234,
+      num_turns: 2,
+      session_id: 'T-usage',
+      result: 'done',
+    });
+
+    const { conn, testClient } = makeConnection(store.paths);
+    await conn.loadSession({ sessionId: 'S-usage', cwd: '/tmp', mcpServers: [] });
+    testClient.notifications = [];
+
+    await conn.prompt({ sessionId: 'S-usage', prompt: [{ type: 'text', text: '/usage' }] });
+
+    const text = testClient.notifications
+      .filter((n) => n.update.sessionUpdate === 'agent_message_chunk')
+      .map((n) => (n.update as { content: { text: string } }).content.text)
+      .join('\n');
+    expect(text).toContain('Balance: $42.00');
+    expect(text).toContain('Input: 16 tokens');
+    expect(text).toContain('Output: 125 tokens');
+    expect(text).toContain('Cache read: 60 tokens');
+    expect(text).toContain('Cache write: 7 tokens');
+    expect(text).toContain('Duration: 1.23s');
+    expect(text).toContain('Turns: 2');
   });
 });
 

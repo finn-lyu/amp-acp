@@ -40,6 +40,7 @@ import {
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { execFile, type ExecFileException } from 'node:child_process';
 import packageJson from '../package.json';
 
 const PACKAGE_VERSION: string = packageJson.version;
@@ -58,6 +59,10 @@ const AMP_ACP_LOG_FILE_ENV = 'AMP_ACP_LOG_FILE';
 
 const AMP_LOG_LEVELS = ['debug', 'info', 'warn', 'error', 'audit'] as const;
 type AmpLogLevel = (typeof AMP_LOG_LEVELS)[number];
+
+// `amp usage` may need to reach Amp's API, but an adapter slash command should
+// still return promptly instead of pinning the ACP session forever.
+const AMP_USAGE_COMMAND_TIMEOUT_MS = 15_000;
 
 // Work around @ampcode/sdk@0.1.0-2026-05-19 + @ampcode/cli@0.0.1779181266 mismatch:
 // the SDK's resolveLocalAmpPackageCommand() runs `node <bin/amp.exe>`, but the new
@@ -89,6 +94,25 @@ export interface UsageSnapshot {
   numTurns: number;
 }
 
+export interface AmpUsageCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  errorMessage?: string;
+}
+
+export type AmpUsageRunner = () => Promise<AmpUsageCommandResult>;
+
+interface UsageAccumulator {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  sawCacheCreationInputTokens: boolean;
+  sawCacheReadInputTokens: boolean;
+  sawUsage: boolean;
+}
+
 interface SessionState {
   threadId: string | null;
   controller: AbortController | null;
@@ -116,6 +140,10 @@ interface InitializeResponseWithAgentInfo extends InitializeResponse {
   };
 }
 
+interface AmpAcpAgentOptions {
+  usageRunner?: AmpUsageRunner;
+}
+
 function buildModeState(currentModeId: AmpMode): NonNullable<NewSessionResponse['modes']> {
   return {
     currentModeId,
@@ -132,10 +160,16 @@ export class AmpAcpAgent implements Agent {
   sessions = new Map<string, SessionState>();
   private clientCapabilities?: ClientCapabilities;
   private storePaths: SessionStorePaths;
+  private usageRunner: AmpUsageRunner;
 
-  constructor(client: AgentSideConnection, storePaths: SessionStorePaths = getSessionStorePaths()) {
+  constructor(
+    client: AgentSideConnection,
+    storePaths: SessionStorePaths = getSessionStorePaths(),
+    options: AmpAcpAgentOptions = {},
+  ) {
     this.client = client;
     this.storePaths = storePaths;
+    this.usageRunner = options.usageRunner ?? runAmpUsageCommand;
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponseWithAgentInfo> {
@@ -252,12 +286,7 @@ export class AmpAcpAgent implements Agent {
 
     let lastAssistantStopReason: AssistantStopReason = null;
     let lastResult: StreamMessage | null = null;
-    let pendingAssistantUsage: {
-      input_tokens: number;
-      output_tokens: number;
-      cache_creation_input_tokens?: number;
-      cache_read_input_tokens?: number;
-    } | undefined;
+    let pendingUsage = createUsageAccumulator();
 
     try {
       for await (const message of execute({ prompt: textInput, options, signal: controller.signal })) {
@@ -274,9 +303,7 @@ export class AmpAcpAgent implements Agent {
 
         if (message.type === 'assistant') {
           lastAssistantStopReason = message.message?.stop_reason ?? lastAssistantStopReason;
-          // Usage actually lives on assistant.message.usage, NOT on result.usage —
-          // despite what the SDK type claims. Capture as we see it, finalize on result.
-          if (message.message?.usage) pendingAssistantUsage = message.message.usage;
+          addUsage(pendingUsage, message.message?.usage);
           for (const n of toAcpNotifications(message, params.sessionId)) {
             try {
               await this.client.sessionUpdate(n);
@@ -296,16 +323,9 @@ export class AmpAcpAgent implements Agent {
 
         if (message.type === 'result') {
           lastResult = message;
-          if (pendingAssistantUsage) {
-            s.lastUsage = {
-              inputTokens: pendingAssistantUsage.input_tokens,
-              outputTokens: pendingAssistantUsage.output_tokens,
-              cacheCreationInputTokens: pendingAssistantUsage.cache_creation_input_tokens,
-              cacheReadInputTokens: pendingAssistantUsage.cache_read_input_tokens,
-              durationMs: message.duration_ms,
-              numTurns: message.num_turns,
-            };
-          }
+          const usage = finishUsageSnapshot(pendingUsage, message);
+          if (usage) s.lastUsage = usage;
+          pendingUsage = createUsageAccumulator();
           if (message.is_error) {
             if (typeof message.error === 'string' && isAuthError(message.error)) {
               console.error('[amp] Auth error in result, requesting authentication:', message.error);
@@ -377,6 +397,7 @@ export class AmpAcpAgent implements Agent {
     }
     const mode: AmpMode = isAmpMode(entry.mode) ? entry.mode : 'smart';
     const mcpConfig = convertAcpMcpServersToAmpConfig(params.mcpServers);
+    const lastUsage = usageSnapshotFromMessages(readLog(this.storePaths, params.sessionId));
     this.sessions.set(params.sessionId, {
       threadId: entry.threadId,
       controller: null,
@@ -385,7 +406,7 @@ export class AmpAcpAgent implements Agent {
       mode,
       mcpConfig,
       cwd: params.cwd || process.cwd(),
-      lastUsage: null,
+      lastUsage,
       mcpStatusReported: new Map(),
     });
     // Refresh lastUsedMs so this session isn't evicted while it's actively used.
@@ -482,7 +503,7 @@ export class AmpAcpAgent implements Agent {
         return;
       }
       case 'usage': {
-        await emit(formatUsage(s.lastUsage));
+        await emit(formatUsage(s.lastUsage, await this.usageRunner()));
         return;
       }
       case 'resume': {
@@ -554,6 +575,132 @@ export function readBooleanEnv(
   return defaultValue;
 }
 
+interface UsageFields {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+function createUsageAccumulator(): UsageAccumulator {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    sawCacheCreationInputTokens: false,
+    sawCacheReadInputTokens: false,
+    sawUsage: false,
+  };
+}
+
+function addUsage(acc: UsageAccumulator, usage: UsageFields | undefined): void {
+  if (!usage) return;
+  acc.sawUsage = true;
+  acc.inputTokens += usage.input_tokens;
+  acc.outputTokens += usage.output_tokens;
+  if (usage.cache_creation_input_tokens !== undefined) {
+    acc.sawCacheCreationInputTokens = true;
+    acc.cacheCreationInputTokens += usage.cache_creation_input_tokens;
+  }
+  if (usage.cache_read_input_tokens !== undefined) {
+    acc.sawCacheReadInputTokens = true;
+    acc.cacheReadInputTokens += usage.cache_read_input_tokens;
+  }
+}
+
+function finishUsageSnapshot(
+  acc: UsageAccumulator,
+  result: { duration_ms: number; num_turns: number; usage?: UsageFields },
+): UsageSnapshot | null {
+  // Amp usually reports per-assistant-message usage, while the SDK type also
+  // allows result.usage. Treat result.usage as a fallback only, not an
+  // additional increment, so future SDK changes do not double-count.
+  if (!acc.sawUsage) addUsage(acc, result.usage);
+  if (!acc.sawUsage) return null;
+  return {
+    inputTokens: acc.inputTokens,
+    outputTokens: acc.outputTokens,
+    cacheCreationInputTokens: acc.sawCacheCreationInputTokens ? acc.cacheCreationInputTokens : undefined,
+    cacheReadInputTokens: acc.sawCacheReadInputTokens ? acc.cacheReadInputTokens : undefined,
+    durationMs: result.duration_ms,
+    numTurns: result.num_turns,
+  };
+}
+
+export function usageSnapshotFromMessages(entries: unknown[]): UsageSnapshot | null {
+  let latest: UsageSnapshot | null = null;
+  let pending = createUsageAccumulator();
+
+  for (const entry of entries) {
+    if (!isPlainObject(entry)) continue;
+    if (entry.type === 'assistant') {
+      const message = isPlainObject(entry.message) ? entry.message : null;
+      addUsage(pending, readUsageFields(message?.usage));
+      continue;
+    }
+    if (entry.type !== 'result') continue;
+    if (typeof entry.duration_ms !== 'number' || typeof entry.num_turns !== 'number') {
+      pending = createUsageAccumulator();
+      continue;
+    }
+    const usage = finishUsageSnapshot(pending, {
+      duration_ms: entry.duration_ms,
+      num_turns: entry.num_turns,
+      usage: readUsageFields(entry.usage),
+    });
+    if (usage) latest = usage;
+    pending = createUsageAccumulator();
+  }
+
+  return latest;
+}
+
+function readUsageFields(value: unknown): UsageFields | undefined {
+  if (!isPlainObject(value)) return undefined;
+  if (typeof value.input_tokens !== 'number' || typeof value.output_tokens !== 'number') {
+    return undefined;
+  }
+  const usage: UsageFields = {
+    input_tokens: value.input_tokens,
+    output_tokens: value.output_tokens,
+  };
+  if (typeof value.cache_creation_input_tokens === 'number') {
+    usage.cache_creation_input_tokens = value.cache_creation_input_tokens;
+  }
+  if (typeof value.cache_read_input_tokens === 'number') {
+    usage.cache_read_input_tokens = value.cache_read_input_tokens;
+  }
+  return usage;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function runAmpUsageCommand(env: Record<string, string | undefined> = process.env): Promise<AmpUsageCommandResult> {
+  const command = env.AMP_CLI_PATH?.trim() || 'amp';
+  return new Promise((resolve) => {
+    execFile(
+      command,
+      ['usage'],
+      { env, timeout: AMP_USAGE_COMMAND_TIMEOUT_MS, windowsHide: true },
+      (error: ExecFileException | null, stdout: string, stderr: string) => {
+        resolve({
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          exitCode: error ? readExecExitCode(error) : 0,
+          ...(error ? { errorMessage: error.message } : {}),
+        });
+      },
+    );
+  });
+}
+
+function readExecExitCode(error: ExecFileException): number | null {
+  return typeof error.code === 'number' ? error.code : null;
+}
+
 export function buildAmpOptions(
   { cwd, mode, mcpConfig, threadId }: AmpOptionsInput,
   env: Record<string, string | undefined> = process.env,
@@ -609,11 +756,32 @@ export function detectAdapterSlashCommand(text: string): { command: string; arg:
   return { command, arg: (match[2] ?? '').trim() };
 }
 
-export function formatUsage(usage: UsageSnapshot | null): string {
-  if (!usage) return '[/usage] No usage data yet — this session has not completed a turn.';
+export function formatUsage(usage: UsageSnapshot | null, ampUsage?: AmpUsageCommandResult | null): string {
+  const sections: string[] = [];
+  if (ampUsage) sections.push(formatAmpUsageCommandResult(ampUsage));
+  sections.push(formatTokenUsage(usage));
+  return sections.join('\n\n');
+}
+
+function formatAmpUsageCommandResult(result: AmpUsageCommandResult): string {
+  const lines = ['**Amp account usage**'];
+  if (result.stdout) {
+    lines.push('```text', result.stdout, '```');
+  } else {
+    const reason = result.errorMessage ?? (result.exitCode === 0 ? 'No output from `amp usage`.' : '`amp usage` failed.');
+    lines.push(reason);
+  }
+  if (result.exitCode !== 0 && result.stderr) {
+    lines.push('', '**amp usage stderr**', '```text', result.stderr, '```');
+  }
+  return lines.join('\n');
+}
+
+function formatTokenUsage(usage: UsageSnapshot | null): string {
+  if (!usage) return '[/usage] No usage data yet — this session has not completed a turn with token data.';
   const fmt = (n: number): string => n.toLocaleString();
   const lines = [
-    '**Usage (latest turn)**',
+    '**Latest turn tokens**',
     `- Input: ${fmt(usage.inputTokens)} tokens`,
     `- Output: ${fmt(usage.outputTokens)} tokens`,
   ];

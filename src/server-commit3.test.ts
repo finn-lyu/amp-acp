@@ -6,9 +6,11 @@ import { ClientSideConnection, AgentSideConnection, ndJsonStream } from '@agentc
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import {
   AmpAcpAgent,
+  type AmpUsageCommandResult,
   buildAmpOptions,
   detectAdapterSlashCommand,
   formatUsage,
+  usageSnapshotFromMessages,
 } from './server.js';
 import type { SessionStorePaths } from './session-store.js';
 
@@ -32,12 +34,17 @@ function makeConnection(storePaths: SessionStorePaths) {
   const clientToAgent = new TransformStream();
   const agentToClient = new TransformStream();
   const testClient = new TestClient();
+  const usageRunner = async (): Promise<AmpUsageCommandResult> => ({
+    stdout: 'Balance: $42.00\nToday: $0.25',
+    stderr: '',
+    exitCode: 0,
+  });
   const conn = new ClientSideConnection(
     () => testClient,
     ndJsonStream(clientToAgent.writable, agentToClient.readable),
   );
   new AgentSideConnection(
-    (client) => new AmpAcpAgent(client, storePaths),
+    (client) => new AmpAcpAgent(client, storePaths, { usageRunner }),
     ndJsonStream(agentToClient.writable, clientToAgent.readable),
   );
   return { conn, testClient };
@@ -84,6 +91,28 @@ describe('formatUsage', () => {
     expect(out).toContain('Turns: 3');
   });
 
+  it('includes stdout from amp usage when provided', () => {
+    const out = formatUsage(
+      { inputTokens: 1, outputTokens: 2, durationMs: 1000, numTurns: 1 },
+      { stdout: 'Balance: $42.00', stderr: '', exitCode: 0 },
+    );
+
+    expect(out).toContain('Amp account usage');
+    expect(out).toContain('Balance: $42.00');
+    expect(out).toContain('Latest turn tokens');
+  });
+
+  it('includes stderr details when amp usage fails', () => {
+    const out = formatUsage(
+      null,
+      { stdout: '', stderr: 'not logged in', exitCode: 1, errorMessage: 'Command failed: amp usage' },
+    );
+
+    expect(out).toContain('Command failed: amp usage');
+    expect(out).toContain('not logged in');
+    expect(out).toContain('No usage data yet');
+  });
+
   it('omits cache fields when undefined', () => {
     const out = formatUsage({ inputTokens: 1, outputTokens: 2, durationMs: 1000, numTurns: 1 });
     expect(out).not.toContain('Cache read');
@@ -92,6 +121,79 @@ describe('formatUsage', () => {
 
   it('explains absent data when no usage is recorded yet', () => {
     expect(formatUsage(null)).toContain('No usage data yet');
+  });
+});
+
+describe('usageSnapshotFromMessages', () => {
+  it('aggregates usage across multiple assistant messages in one completed turn', () => {
+    const usage = usageSnapshotFromMessages([
+      {
+        type: 'assistant',
+        message: {
+          usage: {
+            input_tokens: 10,
+            output_tokens: 100,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 50,
+          },
+        },
+      },
+      {
+        type: 'assistant',
+        message: {
+          usage: {
+            input_tokens: 6,
+            output_tokens: 25,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 10,
+          },
+        },
+      },
+      { type: 'result', duration_ms: 1234, num_turns: 2, is_error: false },
+    ]);
+
+    expect(usage).toEqual({
+      inputTokens: 16,
+      outputTokens: 125,
+      cacheCreationInputTokens: 7,
+      cacheReadInputTokens: 60,
+      durationMs: 1234,
+      numTurns: 2,
+    });
+  });
+
+  it('uses result.usage as a fallback when assistant usage is absent', () => {
+    const usage = usageSnapshotFromMessages([
+      {
+        type: 'result',
+        duration_ms: 2500,
+        num_turns: 1,
+        is_error: false,
+        usage: { input_tokens: 3, output_tokens: 4 },
+      },
+    ]);
+
+    expect(usage).toEqual({
+      inputTokens: 3,
+      outputTokens: 4,
+      durationMs: 2500,
+      numTurns: 1,
+    });
+  });
+
+  it('keeps the latest completed turn with usage when later results have none', () => {
+    const usage = usageSnapshotFromMessages([
+      { type: 'assistant', message: { usage: { input_tokens: 1, output_tokens: 2 } } },
+      { type: 'result', duration_ms: 1000, num_turns: 1, is_error: false },
+      { type: 'result', duration_ms: 2, num_turns: 0, is_error: true },
+    ]);
+
+    expect(usage).toEqual({
+      inputTokens: 1,
+      outputTokens: 2,
+      durationMs: 1000,
+      numTurns: 1,
+    });
   });
 });
 
@@ -237,6 +339,7 @@ describe('/usage on a fresh session returns the "no data yet" message', () => {
       .filter((n) => n.update.sessionUpdate === 'agent_message_chunk')
       .map((n) => (n.update as { content: { text: string } }).content.text)
       .join('\n');
+    expect(text).toContain('Balance: $42.00');
     expect(text).toContain('No usage data yet');
   });
 });
