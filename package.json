@@ -1,6 +1,6 @@
 {
   "name": "amp-acp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": false,
   "type": "module",
   "main": "dist/index.js",
@@ -14,7 +14,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tao12345666333/amp-acp"
+    "url": "https://github.com/finnlyu/amp-acp"
   },
   "scripts": {
     "build": "bun build src/index.ts --target=node --outdir=dist --entry-naming=[dir]/[name].js",
@@ -27,11 +27,14 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "0.4.8",
-    "@sourcegraph/amp": "^0.0.1765685598-g5365e6",
-    "@sourcegraph/amp-sdk": "0.1.0-20260220044036-g88868e6"
+    "@ampcode/cli": "0.0.1779181266-g25c2b3",
+    "@ampcode/sdk": "0.1.0-20260519092322-g25c2b32"
   },
   "devDependencies": {
     "@types/bun": "^1.2.5",
     "typescript": "^5.9.3"
-  }
+  },
+  "trustedDependencies": [
+    "@ampcode/cli"
+  ]
 }

@@ -48,8 +48,9 @@ Download the binary for your platform, make it executable (`chmod +x` on Linux/m
 - **Streaming responses** — Amp messages, tool calls, and thinking are streamed in real-time via ACP
 - **Image support** — Handles image content blocks from Amp (base64 and URL)
 - **MCP passthrough** — MCP servers configured in Zed are automatically passed through to Amp
-- **Amp modes** — Switch between *Smart* (default), *Rush* (faster, cheaper), and *Deep* (extended reasoning) via your ACP client's mode picker
+- **Amp modes** — Switch between *Smart* (default), *Rush* (faster, cheaper), and *Deep* (extended reasoning) via your ACP client's mode picker. **Large** is currently not accepted
 - **Extended thinking toggle** — On by default; set `AMP_ACP_THINKING=false` in the adapter's `env` to disable
+- **Permission policy passthrough** — Uses Amp's normal permission behavior by default; set `AMP_ACP_DANGEROUSLY_ALLOW_ALL=true` in the adapter's `env` to force SDK permission bypass
 - **`/init` command** — Type `/init` to generate an `AGENTS.md` file for your project
 - **Conversation continuity** — Thread context is preserved across multiple prompts within a session
 

@@ -21,22 +21,58 @@ import {
   type WriteTextFileResponse,
   type ClientCapabilities,
 } from '@agentclientprotocol/sdk';
-import { execute, type StreamMessage } from '@sourcegraph/amp-sdk';
+import { execute, type AmpOptions, type StreamMessage } from '@ampcode/sdk';
 import { convertAcpMcpServersToAmpConfig, type AmpMcpConfig } from './mcp-config.js';
 import { toAcpNotifications } from './to-acp.js';
 import path from 'node:path';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import packageJson from '../package.json';
 
 const PACKAGE_VERSION: string = packageJson.version;
+
+const AMP_MODES = ['smart', 'rush', 'deep'] as const;
+export type AmpMode = (typeof AMP_MODES)[number];
+
+const AMP_ACP_THINKING_ENV = 'AMP_ACP_THINKING';
+const AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV = 'AMP_ACP_DANGEROUSLY_ALLOW_ALL';
+
+// Work around @ampcode/sdk@0.1.0-2026-05-19 + @ampcode/cli@0.0.1779181266 mismatch:
+// the SDK's resolveLocalAmpPackageCommand() runs `node <bin/amp.exe>`, but the new
+// CLI's bin file is the native binary itself (not a JS wrapper). Point the SDK at
+// the binary via AMP_CLI_PATH so it spawns it directly.
+if (!process.env.AMP_CLI_PATH) {
+  try {
+    const req = createRequire(import.meta.url);
+    const pkgJsonPath = req.resolve('@ampcode/cli/package.json');
+    const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8')) as { bin?: { amp?: string } };
+    if (pkgJson.bin?.amp) {
+      const binPath = path.join(path.dirname(pkgJsonPath), pkgJson.bin.amp);
+      if (fs.existsSync(binPath)) {
+        process.env.AMP_CLI_PATH = binPath;
+      }
+    }
+  } catch {
+    // @ampcode/cli not resolvable at runtime (e.g. compiled binary build).
+    // The SDK will fall back to $AMP_HOME/bin/amp or PATH lookup.
+  }
+}
 
 interface SessionState {
   threadId: string | null;
   controller: AbortController | null;
   cancelled: boolean;
   active: boolean;
-  mode: string;
+  mode: AmpMode;
   mcpConfig: AmpMcpConfig;
   cwd: string;
+}
+
+export interface AmpOptionsInput {
+  cwd: string;
+  mode: AmpMode;
+  mcpConfig: AmpMcpConfig;
+  threadId: string | null;
 }
 
 interface InitializeResponseWithAgentInfo extends InitializeResponse {
@@ -97,7 +133,7 @@ export class AmpAcpAgent implements Agent {
       controller: null,
       cancelled: false,
       active: false,
-      mode: 'default',
+      mode: 'smart',
       mcpConfig,
       cwd: params.cwd || process.cwd(),
     });
@@ -105,10 +141,11 @@ export class AmpAcpAgent implements Agent {
     const result: NewSessionResponse = {
       sessionId,
       modes: {
-        currentModeId: 'default',
+        currentModeId: 'smart',
         availableModes: [
-          { id: 'default', name: 'Default', description: 'Prompts for permission on first use of each tool' },
-          { id: 'bypass', name: 'Bypass', description: 'Skips all permission prompts' },
+          { id: 'smart', name: 'Smart', description: 'Balanced mode with full capabilities' },
+          { id: 'rush', name: 'Rush', description: 'Faster responses with streamlined tool usage' },
+          { id: 'deep', name: 'Deep', description: 'Extended reasoning for complex tasks' },
         ],
       },
     };
@@ -180,22 +217,12 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLA
       }
     }
 
-    const options: Record<string, unknown> = {
+    const options = buildAmpOptions({
       cwd: s.cwd,
-      env: { TERM: 'dumb' },
-    };
-
-    if (s.mode === 'bypass') {
-      options.dangerouslyAllowAll = true;
-    }
-
-    if (Object.keys(s.mcpConfig).length > 0) {
-      options.mcpConfig = s.mcpConfig;
-    }
-
-    if (s.threadId) {
-      options.continue = s.threadId;
-    }
+      mode: s.mode,
+      mcpConfig: s.mcpConfig,
+      threadId: s.threadId,
+    });
 
     const controller = new AbortController();
     s.controller = controller;
@@ -255,17 +282,59 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules), Claude rules (CLA
     }
   }
 
-  async setSessionModel(_params: SetSessionModelRequest): Promise<SetSessionModelResponse> { return {}; }
+  async setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse> {
+    console.warn('[amp-acp] setSessionModel not supported by @ampcode/sdk; ignoring', params.modelId);
+    return {};
+  }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const s = this.sessions.get(params.sessionId);
     if (!s) throw new Error('Session not found');
+    if (!isAmpMode(params.modeId)) {
+      throw new RequestError(-32602, `Unknown mode: ${params.modeId}`);
+    }
     s.mode = params.modeId;
     return {};
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> { return this.client.readTextFile(params); }
   async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> { return this.client.writeTextFile(params); }
+}
+
+export function isAmpMode(value: unknown): value is AmpMode {
+  return typeof value === 'string' && (AMP_MODES as readonly string[]).includes(value);
+}
+
+export function readBooleanEnv(
+  name: string,
+  defaultValue: boolean,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const value = env[name]?.trim().toLowerCase();
+  if (value === undefined || value === '') return defaultValue;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return defaultValue;
+}
+
+export function buildAmpOptions(
+  { cwd, mode, mcpConfig, threadId }: AmpOptionsInput,
+  env: Record<string, string | undefined> = process.env,
+): AmpOptions {
+  const options: AmpOptions = {
+    cwd,
+    env: { TERM: 'dumb' },
+    mode,
+    thinking: readBooleanEnv(AMP_ACP_THINKING_ENV, true, env),
+    ...(Object.keys(mcpConfig).length > 0 ? { mcpConfig } : {}),
+    ...(threadId ? { continue: threadId } : {}),
+  };
+
+  if (readBooleanEnv(AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV, false, env)) {
+    options.dangerouslyAllowAll = true;
+  }
+
+  return options;
 }
 
 export function isAuthError(message: string): boolean {

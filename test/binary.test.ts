@@ -131,9 +131,9 @@ describe('Binary integration tests', () => {
     expect(typeof resp.result!.sessionId).toBe('string');
     expect((resp.result!.sessionId as string).startsWith('S-')).toBe(true);
     const modes = resp.result!.modes as Record<string, unknown>;
-    expect(modes.currentModeId).toBe('default');
+    expect(modes.currentModeId).toBe('smart');
     const availableModes = modes.availableModes as Array<{ id: string }>;
-    expect(availableModes.map((m) => m.id)).toEqual(['default', 'bypass']);
+    expect(availableModes.map((m) => m.id)).toEqual(['smart', 'rush', 'deep']);
   });
 
   it('session/new with MCP servers returns valid sessionId', async () => {
@@ -168,7 +168,7 @@ describe('Binary integration tests', () => {
 
     const resp = await sendAndWait('session/set_mode', {
       sessionId,
-      modeId: 'bypass',
+      modeId: 'rush',
     });
 
     expect(resp.result).toEqual({});

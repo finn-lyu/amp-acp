@@ -62,9 +62,9 @@ describe('ACP Protocol End-to-End', () => {
 
     expect(response.sessionId).toBeDefined();
     expect(response.sessionId).toMatch(/^S-/);
-    expect(response.modes?.currentModeId).toBe('default');
-    expect(response.modes?.availableModes).toHaveLength(2);
-    expect(response.modes?.availableModes?.map((m) => m.id)).toEqual(['default', 'bypass']);
+    expect(response.modes?.currentModeId).toBe('smart');
+    expect(response.modes?.availableModes).toHaveLength(3);
+    expect(response.modes?.availableModes?.map((m) => m.id)).toEqual(['smart', 'rush', 'deep']);
   });
 
   it('should handle newSession with MCP servers', async () => {
@@ -98,29 +98,25 @@ describe('ACP Protocol End-to-End', () => {
 
     const result = await agentConnection.setSessionMode({
       sessionId: session.sessionId,
-      modeId: 'bypass',
+      modeId: 'rush',
     });
 
     expect(result).toEqual({});
   });
 
-  it('should handle setSessionMode for both default and bypass', async () => {
+  it('should handle setSessionMode across all amp modes', async () => {
     const session = await agentConnection.newSession({
       cwd: '/tmp',
       mcpServers: [],
     });
 
-    const r1 = await agentConnection.setSessionMode({
-      sessionId: session.sessionId,
-      modeId: 'bypass',
-    });
-    expect(r1).toEqual({});
-
-    const r2 = await agentConnection.setSessionMode({
-      sessionId: session.sessionId,
-      modeId: 'default',
-    });
-    expect(r2).toEqual({});
+    for (const modeId of ['smart', 'rush', 'deep']) {
+      const r = await agentConnection.setSessionMode({
+        sessionId: session.sessionId,
+        modeId,
+      });
+      expect(r).toEqual({});
+    }
   });
 
   it('should reject authenticate when AMP_API_KEY is not set', async () => {
