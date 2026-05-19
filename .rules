@@ -1,7 +1,9 @@
 # AGENTS.md
 
 ## Amp Code SDK reference
-Amp Code has deprecated @sourcegraph/amp-sdk and migrated to @ampcode/sdk. This `amp-acp` fork is based on the new Amp Code SDK and adds support for Amp-native features like Mode (Smart/Rush/Deep/Large).
+Amp Code has [deprecated @sourcegraph/amp-sdk](https://ampcode.com/news/npm-package-changes) and [migrated to @ampcode/sdk](https://ampcode.com/manual/sdk). 
+
+This `amp-acp` fork is based on the new Amp Code SDK and adds support for Amp-native features like Mode (Smart/Rush/Deep/Large).
 
 ## Commands
 - `bun run build` — Bundle TypeScript to `dist/index.js` (single file, Bun target)

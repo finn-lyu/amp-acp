@@ -6,7 +6,6 @@ on:
       - 'v*'
 
 permissions:
-  id-token: write
   contents: write
 
 jobs:
@@ -56,15 +55,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Update npm to latest
-        run: npm install -g npm@latest
-
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
@@ -73,9 +63,6 @@ jobs:
 
       - name: Build
         run: bun run build
-
-      - name: Publish to npm
-        run: npm publish --access public
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
