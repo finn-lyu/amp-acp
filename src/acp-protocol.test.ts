@@ -212,7 +212,8 @@ describe('toAcpNotifications', () => {
       toolCallId: 'tool-1',
       title: 'Read',
       status: 'pending',
-      kind: 'other',
+      kind: 'read',
+      locations: [{ path: '/tmp/file.txt' }],
     });
   });
 

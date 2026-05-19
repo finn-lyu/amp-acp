@@ -6,6 +6,8 @@ import {
   type InitializeResponse,
   type NewSessionRequest,
   type NewSessionResponse,
+  type LoadSessionRequest,
+  type LoadSessionResponse,
   type PromptRequest,
   type PromptResponse,
   type AuthenticateRequest,
@@ -27,6 +29,14 @@ type AssistantStopReason = 'end_turn' | 'tool_use' | 'max_tokens' | null;
 type AcpStopReason = 'end_turn' | 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled';
 import { convertAcpMcpServersToAmpConfig, type AmpMcpConfig } from './mcp-config.js';
 import { toAcpNotifications } from './to-acp.js';
+import {
+  getSessionStorePaths,
+  recordSession,
+  lookupSession,
+  appendLogEntry,
+  readLog,
+  type SessionStorePaths,
+} from './session-store.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -86,13 +96,26 @@ interface InitializeResponseWithAgentInfo extends InitializeResponse {
   };
 }
 
+function buildModeState(currentModeId: AmpMode): NonNullable<NewSessionResponse['modes']> {
+  return {
+    currentModeId,
+    availableModes: [
+      { id: 'smart', name: 'Smart', description: 'Balanced mode with full capabilities' },
+      { id: 'rush', name: 'Rush', description: 'Faster responses with streamlined tool usage' },
+      { id: 'deep', name: 'Deep', description: 'Extended reasoning for complex tasks' },
+    ],
+  };
+}
+
 export class AmpAcpAgent implements Agent {
   private client: AgentSideConnection;
   sessions = new Map<string, SessionState>();
   private clientCapabilities?: ClientCapabilities;
+  private storePaths: SessionStorePaths;
 
-  constructor(client: AgentSideConnection) {
+  constructor(client: AgentSideConnection, storePaths: SessionStorePaths = getSessionStorePaths()) {
     this.client = client;
+    this.storePaths = storePaths;
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponseWithAgentInfo> {
@@ -106,6 +129,7 @@ export class AmpAcpAgent implements Agent {
         version: PACKAGE_VERSION,
       },
       agentCapabilities: {
+        loadSession: true,
         // image is intentionally omitted: @ampcode/sdk's ExecuteOptions.prompt only
         // accepts string | AsyncIterable<UserInputMessage>, and UserInputMessage
         // content is text-only. Advertising image:true would be a false promise.
@@ -146,33 +170,11 @@ export class AmpAcpAgent implements Agent {
 
     const result: NewSessionResponse = {
       sessionId,
-      modes: {
-        currentModeId: 'smart',
-        availableModes: [
-          { id: 'smart', name: 'Smart', description: 'Balanced mode with full capabilities' },
-          { id: 'rush', name: 'Rush', description: 'Faster responses with streamlined tool usage' },
-          { id: 'deep', name: 'Deep', description: 'Extended reasoning for complex tasks' },
-        ],
-      },
+      modes: buildModeState('smart'),
     };
 
     setImmediate(async () => {
-      try {
-        await this.client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: 'available_commands_update',
-            availableCommands: [
-              {
-                name: 'init',
-                description: 'Generate an AGENTS.md file for the project',
-              },
-            ],
-          },
-        });
-      } catch (e) {
-        console.error('[acp] failed to send available_commands_update', e);
-      }
+      await this.sendAvailableCommandsUpdate(sessionId);
     });
 
     return result;
@@ -221,7 +223,10 @@ export class AmpAcpAgent implements Agent {
       for await (const message of execute({ prompt: textInput, options, signal: controller.signal })) {
         if (!s.threadId && message.session_id) {
           s.threadId = message.session_id;
+          this.persistSessionEntry(params.sessionId, s);
         }
+
+        this.appendToSessionLog(params.sessionId, message);
 
         if (message.type === 'assistant') {
           lastAssistantStopReason = message.message?.stop_reason ?? lastAssistantStopReason;
@@ -296,7 +301,96 @@ export class AmpAcpAgent implements Agent {
       throw new RequestError(-32602, `Unknown mode: ${params.modeId}`);
     }
     s.mode = params.modeId;
+    this.persistSessionEntry(params.sessionId, s);
+    try {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: 'current_mode_update', currentModeId: params.modeId },
+      });
+    } catch (e) {
+      console.error('[acp] failed to send current_mode_update', e);
+    }
     return {};
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const entry = lookupSession(this.storePaths, params.sessionId);
+    if (!entry) {
+      throw new RequestError(-32602, `Session not found: ${params.sessionId}`);
+    }
+    const mode: AmpMode = isAmpMode(entry.mode) ? entry.mode : 'smart';
+    const mcpConfig = convertAcpMcpServersToAmpConfig(params.mcpServers);
+    this.sessions.set(params.sessionId, {
+      threadId: entry.threadId,
+      controller: null,
+      cancelled: false,
+      active: false,
+      mode,
+      mcpConfig,
+      cwd: params.cwd || process.cwd(),
+    });
+    // Refresh lastUsedMs so this session isn't evicted while it's actively used.
+    recordSession(this.storePaths, params.sessionId, { threadId: entry.threadId, mode });
+    await this.replaySessionLog(params.sessionId);
+    await this.sendAvailableCommandsUpdate(params.sessionId);
+    return { modes: buildModeState(mode) };
+  }
+
+  private persistSessionEntry(sessionId: string, s: SessionState): void {
+    if (!s.threadId) return;
+    try {
+      recordSession(this.storePaths, sessionId, { threadId: s.threadId, mode: s.mode });
+    } catch (e) {
+      console.error('[acp] failed to persist session entry', e);
+    }
+  }
+
+  private appendToSessionLog(sessionId: string, message: StreamMessage): void {
+    try {
+      appendLogEntry(this.storePaths, sessionId, message);
+    } catch (e) {
+      console.error('[acp] failed to append session log', e);
+    }
+  }
+
+  private async replaySessionLog(sessionId: string): Promise<void> {
+    let entries: unknown[];
+    try {
+      entries = readLog(this.storePaths, sessionId);
+    } catch (e) {
+      console.error('[acp] failed to read session log', e);
+      return;
+    }
+    for (const entry of entries) {
+      const message = entry as StreamMessage;
+      if (message.type !== 'assistant' && message.type !== 'user') continue;
+      for (const n of toAcpNotifications(message, sessionId)) {
+        try {
+          await this.client.sessionUpdate(n);
+        } catch (e) {
+          console.error('[acp] sessionUpdate during replay failed', e);
+        }
+      }
+    }
+  }
+
+  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [
+            {
+              name: 'init',
+              description: 'Generate an AGENTS.md file for the project',
+            },
+          ],
+        },
+      });
+    } catch (e) {
+      console.error('[acp] failed to send available_commands_update', e);
+    }
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> { return this.client.readTextFile(params); }

@@ -101,7 +101,11 @@ describe('Binary integration tests', () => {
     expect(agentInfo).toBeDefined();
     expect(agentInfo.name).toBe('amp-acp');
     expect(agentInfo.version).toBeDefined();
-    const caps = resp.result!.agentCapabilities as Record<string, Record<string, boolean>>;
+    const caps = resp.result!.agentCapabilities as Record<string, unknown> & {
+      promptCapabilities: Record<string, boolean | undefined>;
+      mcpCapabilities: Record<string, boolean>;
+    };
+    expect(caps.loadSession).toBe(true);
     expect(caps.promptCapabilities.image).toBeUndefined();
     expect(caps.promptCapabilities.embeddedContext).toBe(true);
     expect(caps.mcpCapabilities.http).toBe(true);
