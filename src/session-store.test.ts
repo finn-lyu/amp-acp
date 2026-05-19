@@ -122,6 +122,26 @@ describe('appendLogEntry / readLog round-trip', () => {
     // The file should still be readable through the same sessionId.
     expect(readLog(ctx.paths, 'S-with/slash')).toEqual([{ a: 1 }]);
   });
+
+  it('stops appending once the per-session log exceeds the cap', () => {
+    const sessionId = 'S-cap';
+    // Each `{"idx":N}\n` entry is 10 bytes. Cap at 20 → first 2 fit, 3rd & 4th dropped.
+    const cap = 20;
+    appendLogEntry(ctx.paths, sessionId, { idx: 1 }, cap);
+    appendLogEntry(ctx.paths, sessionId, { idx: 2 }, cap);
+    appendLogEntry(ctx.paths, sessionId, { idx: 3 }, cap);
+    appendLogEntry(ctx.paths, sessionId, { idx: 4 }, cap);
+    expect(readLog(ctx.paths, sessionId)).toEqual([{ idx: 1 }, { idx: 2 }]);
+  });
+
+  it('writes the first entry even when the cap is below a single entry size', () => {
+    // A 1-byte cap should still let the first entry through (we check size BEFORE
+    // writing, and starting size is 0). Subsequent entries get dropped.
+    const sessionId = 'S-cap-1';
+    appendLogEntry(ctx.paths, sessionId, { idx: 1 }, 1);
+    appendLogEntry(ctx.paths, sessionId, { idx: 2 }, 1);
+    expect(readLog(ctx.paths, sessionId)).toEqual([{ idx: 1 }]);
+  });
 });
 
 describe('readIndex resilience', () => {

@@ -3,7 +3,16 @@ import path from 'node:path';
 import os from 'node:os';
 
 const MAX_INDEX_ENTRIES = 100;
+const DEFAULT_MAX_LOG_BYTES = 50 * 1024 * 1024;
 const AMP_ACP_SESSIONS_DIR_ENV = 'AMP_ACP_SESSIONS_DIR';
+const AMP_ACP_MAX_LOG_BYTES_ENV = 'AMP_ACP_MAX_LOG_BYTES';
+
+function getMaxLogBytes(env: Record<string, string | undefined> = process.env): number {
+  const raw = env[AMP_ACP_MAX_LOG_BYTES_ENV];
+  if (!raw) return DEFAULT_MAX_LOG_BYTES;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_LOG_BYTES;
+}
 
 export interface SessionIndexEntry {
   threadId: string;
@@ -84,9 +93,25 @@ export function lookupSession(paths: SessionStorePaths, sessionId: string): Sess
   return current[sessionId] ?? null;
 }
 
-export function appendLogEntry(paths: SessionStorePaths, sessionId: string, message: unknown): void {
+export function appendLogEntry(
+  paths: SessionStorePaths,
+  sessionId: string,
+  message: unknown,
+  maxBytes: number = getMaxLogBytes(),
+): void {
   fs.mkdirSync(paths.logsDir, { recursive: true });
-  fs.appendFileSync(logFilePath(paths, sessionId), JSON.stringify(message) + '\n');
+  const file = logFilePath(paths, sessionId);
+  // Silently stop appending once the per-session cap is hit. Future writes are
+  // dropped; existing entries (including the live thread) keep flowing on Amp's
+  // side via `continue: threadId`. Replay just covers up to the cap.
+  let currentSize = 0;
+  try {
+    currentSize = fs.statSync(file).size;
+  } catch {
+    // file doesn't exist yet; size stays 0
+  }
+  if (currentSize >= maxBytes) return;
+  fs.appendFileSync(file, JSON.stringify(message) + '\n');
 }
 
 export function readLog(paths: SessionStorePaths, sessionId: string): unknown[] {
