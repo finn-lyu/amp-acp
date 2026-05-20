@@ -2,27 +2,24 @@
 
 [![CI](https://github.com/finnlyu/amp-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/finnlyu/amp-acp/actions/workflows/ci.yml)
 
-![Screenshot](img/screenshot.png)
+Use [Amp](https://ampcode.com) from [ACP](https://agentclientprotocol.com/)-compatible clients such as [Zed](https://zed.dev).
 
-Use [Amp](https://ampcode.com) from [ACP](https://agentclientprotocol.com/)-compatible clients such as [Zed](https://zed.dev) or [Toad](https://github.com/batrachianai/toad).
-
+> [!NOTE]
 > This is a fork. It tracks the new Amp Code SDK and adds first-class support for Amp Code features.
 
 ## Installation
 
 ### Pre-built Binary
 
-Download a standalone binary from the [GitHub Releases](https://github.com/finnlyu/amp-acp/releases) page — no runtime dependencies required.
+Supported platforms:
+- Linux: x64, arm64
+- macOS: x64 (Intel), arm64 (Apple Silicon)
+- Windows: x64
 
-| Platform | Architecture          | Binary                    |
-| -------- | --------------------- | ------------------------- |
-| Linux    | x64                   | `amp-acp-linux-x64`       |
-| Linux    | arm64                 | `amp-acp-linux-arm64`     |
-| macOS    | x64 (Intel)           | `amp-acp-darwin-x64`      |
-| macOS    | arm64 (Apple Silicon) | `amp-acp-darwin-arm64`    |
-| Windows  | x64                   | `amp-acp-windows-x64.exe` |
-
-Download the binary for your platform, make it executable (`chmod +x` on Linux/macOS), and add to your Zed `settings.json` (open with `cmd+,` or `ctrl+,`):
+Setup:
+1. Download the binary for your platform
+2. Make it executable
+3. Add to your Zed `settings.json` (open with `cmd+,` or `ctrl+,`):
 
 ```json
 {
@@ -37,82 +34,20 @@ Download the binary for your platform, make it executable (`chmod +x` on Linux/m
 
 ## Authentication
 
-**If you [have Amp CLI installed](https://ampcode.com/manual#getting-started-command-line-interface)**: Run `amp login` first — credentials are shared automatically.
+- Authenticate within Amp CLI
+- Or configure `AMP_API_KEY` for a headless setup
 
-**If you don't have Amp CLI**: Run `amp-acp --setup` to configure your API key interactively. Alternatively, you can start a chat in Zed's Agent Panel — it will automatically trigger the setup flow if no credentials are found, just follow the prompts.
+Refer to Amp Code Manual for full details.
 
-![Auth Process](img/auth-process.png)
-
-## Features
-
-- **Streaming responses** — Amp messages, tool calls, and thinking are streamed in real-time via ACP
-- **Image support** — Handles image content blocks from Amp (base64 and URL)
-- **MCP passthrough** — MCP servers configured in Zed are automatically passed through to Amp
-- **Amp modes** — Switch between *Smart* (default), *Rush* (faster, cheaper), and *Deep* (extended reasoning) via your ACP client's mode picker. **Large** is currently not accepted
-- **Extended thinking toggle** — On by default; set `AMP_ACP_THINKING=false` in the adapter's `env` to disable
-- **Permission policy passthrough** — Uses Amp's normal permission behavior by default; set `AMP_ACP_DANGEROUSLY_ALLOW_ALL=true` in the adapter's `env` to force SDK permission bypass
-- **`/init` command** — Type `/init` to generate an `AGENTS.md` file for your project
-- **Conversation continuity** — Thread context is preserved across multiple prompts within a session
-
-## MCP Configuration Passthrough
+## MCP Passthrough
 
 MCP servers configured in Zed's `context_servers` are automatically forwarded to Amp. This is compatible with how other ACP agents like [Claude Code](https://github.com/zed-industries/claude-code-acp) and [Codex](https://github.com/zed-industries/codex-acp) handle MCP servers.
 
 ### Supported MCP Server Types
 
-| Type      | Description                           | Example                                                      |
-| --------- | ------------------------------------- | ------------------------------------------------------------ |
-| **stdio** | Local command-line MCP servers        | `@playwright/mcp`, `@modelcontextprotocol/server-filesystem` |
-| **HTTP**  | Remote HTTP MCP servers               | `https://mcp.exa.ai/mcp`                                     |
-| **SSE**   | Remote Server-Sent Events MCP servers | `https://mcp.monday.com/sse`                                 |
-
-### Example: Using Exa Search with Amp
-
-```json
-{
-  "agent_servers": {
-    "Amp": {
-      "type": "custom",
-      "command": "/path/to/amp-acp"
-    }
-  },
-  "context_servers": {
-    "exa": {
-      "url": "https://mcp.exa.ai/mcp"
-    }
-  }
-}
-```
-
-### Example: Multiple MCP Servers
-
-```json
-{
-  "agent_servers": {
-    "Amp": {
-      "type": "custom",
-      "command": "/path/to/amp-acp"
-    }
-  },
-  "context_servers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--headless"]
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"]
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "your-token"
-      }
-    }
-  }
-}
-```
+- STDIO
+- HTTP
+- SSE
 
 For more details, see [docs/mcp-passthrough.md](docs/mcp-passthrough.md).
 
@@ -126,16 +61,6 @@ bun test src/        # Run unit tests
 bun run test:binary  # Run binary integration tests
 bun run test:all     # Run all tests
 ```
-
-## Troubleshooting
-
-**Adapter doesn't start**: Use the Zed ACP Registry (Option 1) or download a pre-built binary (Option 2) and confirm it's executable.
-
-**Connection issues**: Restart Zed and try again. The adapter creates a fresh connection each time.
-
-**Tool execution problems**: Check Zed's output panel for detailed error messages from the Amp SDK.
-
-**MCP server not connecting**: Ensure the MCP server command is correct and any required environment variables are set. Check Zed's logs for connection errors.
 
 ## License
 
