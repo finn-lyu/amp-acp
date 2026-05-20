@@ -38,6 +38,13 @@ import {
   readLog,
   type SessionStorePaths,
 } from './session-store.js';
+import {
+  AMP_ACP_PERMISSION_PROMPTS_ENV,
+  PermissionBroker,
+  buildDelegatedPermissions,
+  getPermissionRuntimeDir,
+  type PermissionDelegateConfig,
+} from './permission-broker.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -124,6 +131,7 @@ interface SessionState {
   cwd: string;
   lastUsage: UsageSnapshot | null;
   mcpStatusReported: Map<string, string>;
+  permissionDecisions: Map<string, 'allow' | 'reject'>;
 }
 
 export interface AmpOptionsInput {
@@ -131,6 +139,7 @@ export interface AmpOptionsInput {
   mode: AmpMode;
   mcpConfig: AmpMcpConfig;
   threadId: string | null;
+  permissionDelegate?: PermissionDelegateConfig | null;
 }
 
 interface InitializeResponseWithAgentInfo extends InitializeResponse {
@@ -161,6 +170,7 @@ export class AmpAcpAgent implements Agent {
   sessions = new Map<string, SessionState>();
   private clientCapabilities?: ClientCapabilities;
   private storePaths: SessionStorePaths;
+  private permissionBroker: PermissionBroker;
   private usageRunner: AmpUsageRunner;
 
   constructor(
@@ -171,6 +181,11 @@ export class AmpAcpAgent implements Agent {
     this.client = client;
     this.storePaths = storePaths;
     this.usageRunner = options.usageRunner ?? runAmpUsageCommand;
+    this.permissionBroker = new PermissionBroker(
+      client,
+      getPermissionRuntimeDir(storePaths.indexFile),
+      (sessionId) => this.sessions.get(sessionId),
+    );
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponseWithAgentInfo> {
@@ -223,6 +238,7 @@ export class AmpAcpAgent implements Agent {
       cwd: params.cwd || process.cwd(),
       lastUsage: null,
       mcpStatusReported: new Map(),
+      permissionDecisions: new Map(),
     });
 
     const result: NewSessionResponse = {
@@ -275,11 +291,16 @@ export class AmpAcpAgent implements Agent {
       return { stopReason: 'end_turn' };
     }
 
+    const permissionDelegate = readBooleanEnv(AMP_ACP_PERMISSION_PROMPTS_ENV, true)
+      ? await this.permissionBroker.prepareSession(params.sessionId)
+      : null;
+
     const options = buildAmpOptions({
       cwd: s.cwd,
       mode: s.mode,
       mcpConfig: s.mcpConfig,
       threadId: s.threadId,
+      permissionDelegate,
     });
 
     const controller = new AbortController();
@@ -429,6 +450,7 @@ export class AmpAcpAgent implements Agent {
       cwd: params.cwd || process.cwd(),
       lastUsage,
       mcpStatusReported: new Map(),
+      permissionDecisions: new Map(),
     });
     // Refresh lastUsedMs so this session isn't evicted while it's actively used.
     recordSession(this.storePaths, params.sessionId, { threadId: entry.threadId, mode });
@@ -485,6 +507,7 @@ export class AmpAcpAgent implements Agent {
             { name: 'init', description: 'Generate an AGENTS.md file for the project' },
             { name: 'export', description: 'Export the current Amp thread as markdown' },
             { name: 'usage', description: 'Show token usage for the latest turn' },
+            { name: 'permissions', description: 'Show amp-acp permission delegate status' },
             {
               name: 'resume',
               description: 'Switch this session to an existing Amp thread by ID',
@@ -527,6 +550,10 @@ export class AmpAcpAgent implements Agent {
         await emit(formatUsage(s.lastUsage, await this.usageRunner()));
         return;
       }
+      case 'permissions': {
+        await emit(await this.formatPermissionStatus(sessionId, s));
+        return;
+      }
       case 'resume': {
         const arg = slash.arg;
         if (!arg) {
@@ -547,6 +574,47 @@ export class AmpAcpAgent implements Agent {
       default:
         await emit(`[amp-acp] Unknown adapter command: /${slash.command}`);
     }
+  }
+
+  private async formatPermissionStatus(sessionId: string, s: SessionState): Promise<string> {
+    const promptsEnabled = readBooleanEnv(AMP_ACP_PERMISSION_PROMPTS_ENV, true);
+    const lines = [
+      '**amp-acp permissions**',
+      `- ${AMP_ACP_PERMISSION_PROMPTS_ENV}: ${process.env[AMP_ACP_PERMISSION_PROMPTS_ENV] ?? '(unset)'} -> ${promptsEnabled}`,
+      `- ${AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV}: ${process.env[AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV] ?? '(unset)'}`,
+      `- Session remembered decisions: ${s.permissionDecisions.size}`,
+    ];
+    if (!promptsEnabled) {
+      const options = buildAmpOptions({
+        cwd: s.cwd,
+        mode: s.mode,
+        mcpConfig: s.mcpConfig,
+        threadId: s.threadId,
+        permissionDelegate: null,
+      });
+      lines.push(`- Delegated prompts: disabled`);
+      lines.push(`- dangerouslyAllowAll option: ${options.dangerouslyAllowAll === true ? 'true' : 'unset'}`);
+      return lines.join('\n');
+    }
+    try {
+      const delegate = await this.permissionBroker.prepareSession(sessionId);
+      const options = buildAmpOptions({
+        cwd: s.cwd,
+        mode: s.mode,
+        mcpConfig: s.mcpConfig,
+        threadId: s.threadId,
+        permissionDelegate: delegate,
+      });
+      lines.push('- Delegated prompts: enabled');
+      lines.push(`- Helper: ${delegate.helperCommand}`);
+      lines.push(`- Broker socket configured: ${delegate.env.AMP_ACP_PERMISSION_SOCKET ? 'yes' : 'no'}`);
+      lines.push(`- Broker token configured: ${delegate.env.AMP_ACP_PERMISSION_TOKEN ? 'yes' : 'no'}`);
+      lines.push(`- dangerouslyAllowAll option: ${options.dangerouslyAllowAll === true ? 'true' : 'unset'}`);
+      lines.push(`- Delegate rules: ${options.permissions?.map((p) => `${p.tool} ${JSON.stringify(p.matches)}`).join(', ') ?? '(none)'}`);
+    } catch (e) {
+      lines.push(`- Delegated prompts: failed to initialize (${(e as Error).message})`);
+    }
+    return lines.join('\n');
   }
 
   private async surfaceMcpStatus(
@@ -578,6 +646,10 @@ export class AmpAcpAgent implements Agent {
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> { return this.client.readTextFile(params); }
   async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> { return this.client.writeTextFile(params); }
+
+  async shutdown(): Promise<void> {
+    await this.permissionBroker.dispose();
+  }
 }
 
 export function isAmpMode(value: unknown): value is AmpMode {
@@ -804,7 +876,7 @@ function readExecExitCode(error: ExecFileException): number | null {
 }
 
 export function buildAmpOptions(
-  { cwd, mode, mcpConfig, threadId }: AmpOptionsInput,
+  { cwd, mode, mcpConfig, threadId, permissionDelegate }: AmpOptionsInput,
   env: Record<string, string | undefined> = process.env,
 ): AmpOptions {
   const options: AmpOptions = {
@@ -816,7 +888,14 @@ export function buildAmpOptions(
     ...(threadId ? { continue: threadId } : {}),
   };
 
-  if (readBooleanEnv(AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV, false, env)) {
+  const permissionPrompts = readBooleanEnv(AMP_ACP_PERMISSION_PROMPTS_ENV, true, env);
+  if (permissionPrompts && permissionDelegate) {
+    options.env = { ...options.env, ...permissionDelegate.env };
+    options.permissions = buildDelegatedPermissions(permissionDelegate.helperCommand);
+  } else if (!permissionPrompts && readBooleanEnv(AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV, false, env)) {
+    // The unsafe bypass is retained only for the explicit no-prompts mode.
+    // Stream JSON cannot satisfy Amp's native "ask" policy, so the safe default
+    // uses delegated ACP permissions instead.
     options.dangerouslyAllowAll = true;
   }
 
@@ -854,7 +933,7 @@ export function detectAdapterSlashCommand(text: string): { command: string; arg:
   // /init is intentionally NOT an adapter command — parsePrompt expands it into a
   // regular prompt the model handles. Only commands that should bypass Amp belong
   // here.
-  if (command !== 'export' && command !== 'usage' && command !== 'resume') return null;
+  if (command !== 'export' && command !== 'usage' && command !== 'resume' && command !== 'permissions') return null;
   return { command, arg: (match[2] ?? '').trim() };
 }
 

@@ -30,6 +30,9 @@ function installShutdownHandlers(getAgent: () => AmpAcpAgent | null): void {
           try { s.controller.abort(); } catch { /* ignore */ }
         }
       }
+      void agent.shutdown().catch((e) => {
+        console.error('[acp] permission broker shutdown failed', e);
+      });
     }
     console.error(`[acp] shutting down (${signal})`);
     // Give in-flight abort propagation a moment, then exit. The SDK's spawned

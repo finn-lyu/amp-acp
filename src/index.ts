@@ -9,6 +9,7 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
 import { runAcp } from './run-acp.js';
+import { permissionHelperExitCode, runPermissionHelper } from './permission-broker.js';
 
 function getConfigDir(): string {
   if (process.platform === 'win32') {
@@ -65,7 +66,10 @@ async function setup(): Promise<void> {
   process.exit(0);
 }
 
-if (process.argv.includes('--setup')) {
+if (process.argv.includes('--permission-helper')) {
+  const decision = await runPermissionHelper();
+  process.exit(permissionHelperExitCode(decision));
+} else if (process.argv.includes('--setup')) {
   await setup();
 } else {
   if (!process.env.AMP_API_KEY) {

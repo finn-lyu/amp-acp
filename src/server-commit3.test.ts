@@ -55,6 +55,7 @@ describe('detectAdapterSlashCommand', () => {
     expect(detectAdapterSlashCommand('/export')).toEqual({ command: 'export', arg: '' });
     expect(detectAdapterSlashCommand('/usage')).toEqual({ command: 'usage', arg: '' });
     expect(detectAdapterSlashCommand('/resume T-abc')).toEqual({ command: 'resume', arg: 'T-abc' });
+    expect(detectAdapterSlashCommand('/permissions')).toEqual({ command: 'permissions', arg: '' });
   });
 
   it('does NOT match /init (handled by parsePrompt expansion)', () => {
@@ -265,7 +266,7 @@ describe('available_commands_update advertises the adapter slash commands', () =
       .flatMap((n) =>
         (n.update as { availableCommands: { name: string }[] }).availableCommands.map((c) => c.name),
       );
-    expect(cmds).toEqual(expect.arrayContaining(['init', 'export', 'usage', 'resume']));
+    expect(cmds).toEqual(expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions']));
   });
 });
 

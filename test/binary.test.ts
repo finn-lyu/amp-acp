@@ -224,5 +224,10 @@ describe('Binary integration tests', () => {
 
     expect(notification).toBeDefined();
     expect(notification.method).toBe('session/update');
+    const params = notification.params as Record<string, unknown>;
+    const update = params.update as { availableCommands?: Array<{ name: string }> };
+    expect(update.availableCommands?.map((command) => command.name)).toEqual(
+      expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions']),
+    );
   });
 });

@@ -100,19 +100,60 @@ describe('Amp option environment flags', () => {
     expect(readBooleanEnv('FLAG', false, { FLAG: '1' })).toBe(false);
   });
 
-  it('preserves Amp permission defaults unless explicit bypass is enabled', () => {
+  it('adds delegated permission rules by default when a helper is provided', () => {
     const options = buildAmpOptions(
-      { cwd: '/tmp', mode: 'smart', mcpConfig: {}, threadId: null },
+      {
+        cwd: '/tmp',
+        mode: 'smart',
+        mcpConfig: {},
+        threadId: null,
+        permissionDelegate: { helperCommand: '/tmp/helper.js', env: { AMP_ACP_PERMISSION_SOCKET: '/tmp/sock' } },
+      },
       {},
     );
 
     expect(options.dangerouslyAllowAll).toBeUndefined();
+    expect(options.permissions?.map((p) => [p.tool, p.action, p.to])).toEqual([
+      ['Bash', 'delegate', '/tmp/helper.js'],
+      ['Bash', 'delegate', '/tmp/helper.js'],
+      ['create_file', 'delegate', '/tmp/helper.js'],
+      ['edit_file', 'delegate', '/tmp/helper.js'],
+      ['edit_file', 'delegate', '/tmp/helper.js'],
+      ['Write', 'delegate', '/tmp/helper.js'],
+      ['Write', 'delegate', '/tmp/helper.js'],
+      ['Edit', 'delegate', '/tmp/helper.js'],
+      ['Edit', 'delegate', '/tmp/helper.js'],
+      ['Edit', 'delegate', '/tmp/helper.js'],
+    ]);
+    expect(options.permissions?.map((p) => p.matches)).toEqual([
+      { cmd: '*' },
+      { command: '*' },
+      { path: '*' },
+      { path: '*' },
+      { diff: '*' },
+      { path: '*' },
+      { file_path: '*' },
+      { path: '*' },
+      { file_path: '*' },
+      { diff: '*' },
+    ]);
+    expect(options.env?.AMP_ACP_PERMISSION_SOCKET).toBe('/tmp/sock');
   });
 
-  it('passes dangerouslyAllowAll when AMP_ACP_DANGEROUSLY_ALLOW_ALL=true', () => {
+  it('does not enable the unsafe bypass by default when delegated permission prompts are disabled', () => {
     const options = buildAmpOptions(
       { cwd: '/tmp', mode: 'smart', mcpConfig: {}, threadId: null },
-      { AMP_ACP_DANGEROUSLY_ALLOW_ALL: 'true' },
+      { AMP_ACP_PERMISSION_PROMPTS: 'false' },
+    );
+
+    expect(options.dangerouslyAllowAll).toBeUndefined();
+    expect(options.permissions).toBeUndefined();
+  });
+
+  it('allows explicitly enabling the unsafe bypass when delegated prompts are disabled', () => {
+    const options = buildAmpOptions(
+      { cwd: '/tmp', mode: 'smart', mcpConfig: {}, threadId: null },
+      { AMP_ACP_PERMISSION_PROMPTS: 'false', AMP_ACP_DANGEROUSLY_ALLOW_ALL: 'true' },
     );
 
     expect(options.dangerouslyAllowAll).toBe(true);
