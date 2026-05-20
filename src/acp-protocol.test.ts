@@ -210,10 +210,40 @@ describe('toAcpNotifications', () => {
     expect(result[0].update).toMatchObject({
       sessionUpdate: 'tool_call',
       toolCallId: 'tool-1',
-      title: 'Read',
+      title: 'Read /tmp/file.txt',
       status: 'pending',
       kind: 'read',
       locations: [{ path: '/tmp/file.txt' }],
+    });
+  });
+
+  it('should expose Bash tool calls as display-only terminals when supported', () => {
+    const result = toAcpNotifications(
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tool-bash',
+              name: 'Bash',
+              input: { cmd: 'git diff --cached', cwd: '/repo' },
+            },
+          ],
+        },
+      },
+      'session-1',
+      { createTerminalOutput: true },
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].update).toMatchObject({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tool-bash',
+      title: '`git diff --cached`',
+      kind: 'execute',
+      content: [{ type: 'terminal', terminalId: 'tool-bash' }],
+      _meta: { terminal_info: { terminal_id: 'tool-bash', cwd: '/repo' } },
     });
   });
 
@@ -228,12 +258,51 @@ describe('toAcpNotifications', () => {
       'session-1',
     );
 
-    expect(result).toHaveLength(1);
+    expect(result).toHaveLength(2);
     expect(result[0].update).toMatchObject({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'tool-1',
       status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: 'file contents' } }],
+      rawOutput: { content: 'file contents', is_error: false },
     });
+    expect(result[1].update).toMatchObject({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '**Tool output**\n```text\nfile contents\n```' },
+    });
+  });
+
+  it('should stream Bash tool results through terminal metadata when supported', () => {
+    const result = toAcpNotifications(
+      {
+        type: 'user',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tool-bash',
+              content: JSON.stringify({ output: 'hello\n', exitCode: 0 }),
+              is_error: false,
+            },
+          ],
+        },
+      },
+      'session-1',
+      { terminalOutputToolIds: new Set(['tool-bash']) },
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].update).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tool-bash',
+      status: 'completed',
+      rawOutput: { content: JSON.stringify({ output: 'hello\n', exitCode: 0 }), is_error: false },
+      _meta: {
+        terminal_output: { terminal_id: 'tool-bash', data: 'hello\n' },
+        terminal_exit: { terminal_id: 'tool-bash', exit_code: 0 },
+      },
+    });
+    expect('content' in result[0].update).toBe(false);
   });
 
   it('should convert tool_result block (error)', () => {
@@ -247,11 +316,60 @@ describe('toAcpNotifications', () => {
       'session-1',
     );
 
-    expect(result).toHaveLength(1);
+    expect(result).toHaveLength(2);
     expect(result[0].update).toMatchObject({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'tool-1',
       status: 'failed',
+      content: [{ type: 'content', content: { type: 'text', text: '```\nnot found\n```' } }],
+      rawOutput: { content: 'not found', is_error: true },
+    });
+    expect(result[1].update).toMatchObject({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '**Tool error**\n```text\nnot found\n```' },
+    });
+  });
+
+  it('should convert structured tool_result blocks into displayable output', () => {
+    const result = toAcpNotifications(
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tool-structured',
+              content: [{ type: 'json', value: { ok: true } }],
+              is_error: false,
+            },
+          ],
+        },
+      },
+      'session-1',
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[0].update).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tool-structured',
+      status: 'completed',
+      content: [
+        {
+          type: 'content',
+          content: {
+            type: 'text',
+            text: JSON.stringify({ type: 'json', value: { ok: true } }, null, 2),
+          },
+        },
+      ],
+      rawOutput: { content: [{ type: 'json', value: { ok: true } }], is_error: false },
+    });
+    expect(result[1].update).toMatchObject({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: `**Tool output**\n\`\`\`text\n${JSON.stringify({ type: 'json', value: { ok: true } }, null, 2)}\n\`\`\``,
+      },
     });
   });
 
@@ -291,7 +409,7 @@ describe('toAcpNotifications', () => {
     expect(result).toHaveLength(3);
     expect(result[0].update).toMatchObject({ sessionUpdate: 'agent_thought_chunk' });
     expect(result[1].update).toMatchObject({ sessionUpdate: 'agent_message_chunk' });
-    expect(result[2].update).toMatchObject({ sessionUpdate: 'tool_call', title: 'Bash' });
+    expect(result[2].update).toMatchObject({ sessionUpdate: 'tool_call', title: '`ls`' });
   });
 
   it('should return empty for missing message', () => {

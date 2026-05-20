@@ -22,13 +22,14 @@ import {
   type WriteTextFileRequest,
   type WriteTextFileResponse,
   type ClientCapabilities,
+  type SessionNotification,
 } from '@agentclientprotocol/sdk';
 import { execute, threads, type AmpOptions, type StreamMessage } from '@ampcode/sdk';
 
 type AssistantStopReason = 'end_turn' | 'tool_use' | 'max_tokens' | null;
 type AcpStopReason = 'end_turn' | 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled';
 import { convertAcpMcpServersToAmpConfig, type AmpMcpConfig } from './mcp-config.js';
-import { toAcpNotifications } from './to-acp.js';
+import { isTerminalOutputTool, toAcpNotifications } from './to-acp.js';
 import {
   getSessionStorePaths,
   recordSession,
@@ -287,6 +288,9 @@ export class AmpAcpAgent implements Agent {
     let lastAssistantStopReason: AssistantStopReason = null;
     let lastResult: StreamMessage | null = null;
     let pendingUsage = createUsageAccumulator();
+    let pendingToolResultDisplays: SessionNotification[] = [];
+    const terminalOutputToolIds = new Set<string>();
+    const createTerminalOutput = supportsTerminalOutput(this.clientCapabilities);
 
     try {
       for await (const message of execute({ prompt: textInput, options, signal: controller.signal })) {
@@ -304,7 +308,13 @@ export class AmpAcpAgent implements Agent {
         if (message.type === 'assistant') {
           lastAssistantStopReason = message.message?.stop_reason ?? lastAssistantStopReason;
           addUsage(pendingUsage, message.message?.usage);
-          for (const n of toAcpNotifications(message, params.sessionId)) {
+          rememberTerminalOutputToolCalls(message, terminalOutputToolIds, createTerminalOutput);
+          const notifications = prependPendingToolResultDisplays(
+            pendingToolResultDisplays,
+            toAcpNotifications(message, params.sessionId, { createTerminalOutput, terminalOutputToolIds }),
+          );
+          pendingToolResultDisplays = [];
+          for (const n of notifications) {
             try {
               await this.client.sessionUpdate(n);
             } catch (e) {
@@ -312,7 +322,10 @@ export class AmpAcpAgent implements Agent {
             }
           }
         } else if (message.type === 'user') {
-          for (const n of toAcpNotifications(message, params.sessionId)) {
+          const notifications = toAcpNotifications(message, params.sessionId, { createTerminalOutput, terminalOutputToolIds });
+          const { immediate, deferredDisplays } = splitToolResultDisplayNotifications(notifications);
+          pendingToolResultDisplays.push(...deferredDisplays);
+          for (const n of immediate) {
             try {
               await this.client.sessionUpdate(n);
             } catch (e) {
@@ -322,6 +335,14 @@ export class AmpAcpAgent implements Agent {
         }
 
         if (message.type === 'result') {
+          for (const n of pendingToolResultDisplays) {
+            try {
+              await this.client.sessionUpdate(n);
+            } catch (e) {
+              console.error('[acp] sessionUpdate failed', e);
+            }
+          }
+          pendingToolResultDisplays = [];
           lastResult = message;
           const usage = finishUsageSnapshot(pendingUsage, message);
           if (usage) s.lastUsage = usage;
@@ -672,6 +693,87 @@ function readUsageFields(value: unknown): UsageFields | undefined {
     usage.cache_read_input_tokens = value.cache_read_input_tokens;
   }
   return usage;
+}
+
+type AgentTextNotification = SessionNotification & {
+  update: { sessionUpdate: 'agent_message_chunk'; content: { type: 'text'; text: string } };
+};
+
+function splitToolResultDisplayNotifications(notifications: SessionNotification[]): {
+  immediate: SessionNotification[];
+  deferredDisplays: SessionNotification[];
+} {
+  const immediate: SessionNotification[] = [];
+  const deferredDisplays: SessionNotification[] = [];
+  for (const notification of notifications) {
+    if (isAgentTextNotification(notification)) {
+      deferredDisplays.push(notification);
+    } else {
+      immediate.push(notification);
+    }
+  }
+  return { immediate, deferredDisplays };
+}
+
+function prependPendingToolResultDisplays(
+  pendingDisplays: SessionNotification[],
+  notifications: SessionNotification[],
+): SessionNotification[] {
+  if (pendingDisplays.length === 0) return notifications;
+  const pendingText = pendingDisplays
+    .map(agentNotificationText)
+    .filter((text): text is string => Boolean(text))
+    .join('\n\n');
+  if (!pendingText) return notifications;
+
+  const firstTextIndex = notifications.findIndex(isAgentTextNotification);
+  if (firstTextIndex === -1) return [...pendingDisplays, ...notifications];
+
+  return notifications.map((notification, index) => {
+    if (index !== firstTextIndex || !isAgentTextNotification(notification)) return notification;
+    return {
+      ...notification,
+      update: {
+        ...notification.update,
+        content: {
+          ...notification.update.content,
+          text: `${pendingText}\n\n${notification.update.content.text}`,
+        },
+      },
+    };
+  });
+}
+
+function isAgentTextNotification(notification: SessionNotification): notification is AgentTextNotification {
+  const update = notification.update;
+  if (update.sessionUpdate !== 'agent_message_chunk') return false;
+  const content = update.content;
+  return isPlainObject(content) && content.type === 'text' && typeof content.text === 'string';
+}
+
+function agentNotificationText(notification: SessionNotification): string | null {
+  return isAgentTextNotification(notification) ? notification.update.content.text : null;
+}
+
+function supportsTerminalOutput(capabilities: ClientCapabilities | undefined): boolean {
+  return isPlainObject(capabilities?._meta) && capabilities._meta.terminal_output === true;
+}
+
+function rememberTerminalOutputToolCalls(message: unknown, ids: Set<string>, enabled: boolean): void {
+  if (!enabled || !isPlainObject(message)) return;
+  const inner = isPlainObject(message.message) ? message.message : null;
+  const content = inner?.content;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (!isPlainObject(block)) continue;
+    if (block.type === 'tool_use' && typeof block.id === 'string' && isTerminalOutputTool(asOptionalString(block.name))) {
+      ids.add(block.id);
+    }
+  }
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

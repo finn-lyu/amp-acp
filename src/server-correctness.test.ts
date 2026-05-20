@@ -129,11 +129,15 @@ describe('toAcpNotifications: user-message routing', () => {
       },
       'session-1',
     );
-    expect(out).toHaveLength(1);
+    expect(out).toHaveLength(2);
     expect(out[0].update).toMatchObject({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'tool-7',
       status: 'completed',
+    });
+    expect(out[1].update).toMatchObject({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '**Tool output**\n```text\nok\n```' },
     });
   });
 
@@ -150,9 +154,10 @@ describe('toAcpNotifications: user-message routing', () => {
       },
       'session-1',
     );
-    // Only the tool_result should pass through.
-    expect(out).toHaveLength(1);
+    // Only the tool_result should pass through, along with its display mirror.
+    expect(out).toHaveLength(2);
     expect(out[0].update).toMatchObject({ sessionUpdate: 'tool_call_update', toolCallId: 'tool-8' });
+    expect(out[1].update).toMatchObject({ sessionUpdate: 'agent_message_chunk' });
   });
 
   it('returns no notifications for a user message with a plain string body', () => {

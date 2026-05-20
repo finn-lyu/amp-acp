@@ -30,7 +30,7 @@ interface AmpContentToolUse {
 interface AmpContentToolResult {
   type: 'tool_result';
   tool_use_id: string;
-  content: string | AmpContentText[];
+  content: unknown;
   is_error: boolean;
 }
 
@@ -44,7 +44,16 @@ interface AmpMessage {
   session_id?: string;
 }
 
-export function toAcpNotifications(message: AmpMessage, sessionId: string): SessionNotification[] {
+interface ToAcpNotificationOptions {
+  createTerminalOutput?: boolean;
+  terminalOutputToolIds?: ReadonlySet<string>;
+}
+
+export function toAcpNotifications(
+  message: AmpMessage,
+  sessionId: string,
+  options: ToAcpNotificationOptions = {},
+): SessionNotification[] {
   const content = message.message?.content;
   const isUser = message.type === 'user';
   if (typeof content === 'string') {
@@ -95,26 +104,51 @@ export function toAcpNotifications(message: AmpMessage, sessionId: string): Sess
         const input = isPlainObject(chunk.input) ? chunk.input : {};
         const locations = extractToolLocations(chunk.name, input);
         const diffContent = extractDiffContent(chunk.name, input);
+        const terminalContent = options.createTerminalOutput && isTerminalOutputTool(chunk.name)
+          ? [{ type: 'terminal' as const, terminalId: chunk.id }]
+          : undefined;
+        const cwd = asString(input.cwd);
         update = {
           toolCallId: chunk.id,
           sessionUpdate: 'tool_call' as const,
           rawInput: safeJson(chunk.input),
           status: 'pending' as const,
-          title: chunk.name || 'Tool',
+          title: formatToolTitle(chunk.name, input),
           kind: inferToolKind(chunk.name),
-          content: diffContent ?? [],
+          content: terminalContent ?? diffContent ?? [],
+          ...(terminalContent ? { _meta: { terminal_info: { terminal_id: chunk.id, ...(cwd ? { cwd } : {}) } } } : {}),
           ...(locations ? { locations } : {}),
         };
         break;
       }
-      case 'tool_result':
+      case 'tool_result': {
+        const displayText = toolResultDisplayText(chunk.content);
+        const terminalOutput = options.terminalOutputToolIds?.has(chunk.tool_use_id)
+          ? toolResultTerminalOutput(chunk.tool_use_id, chunk.content, chunk.is_error)
+          : null;
         update = {
           toolCallId: chunk.tool_use_id,
           sessionUpdate: 'tool_call_update' as const,
           status: chunk.is_error ? ('failed' as const) : ('completed' as const),
-          content: toAcpContentArray(chunk.content, chunk.is_error),
+          rawOutput: toolResultRawOutput(chunk.content, chunk.is_error),
+          ...(terminalOutput
+            ? {
+                _meta: terminalOutput,
+              }
+            : { content: toAcpContentArray(chunk.content, chunk.is_error) }),
         };
-        break;
+        if (update) output.push({ sessionId, update });
+        if (displayText && !terminalOutput) {
+          output.push({
+            sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: formatToolResultMessage(displayText, chunk.is_error) } as ContentBlock,
+            },
+          });
+        }
+        continue;
+      }
       default:
         break;
     }
@@ -123,17 +157,101 @@ export function toAcpNotifications(message: AmpMessage, sessionId: string): Sess
   return output;
 }
 
-function toAcpContentArray(content: string | AmpContentText[], isError = false): ToolCallContent[] {
+function toAcpContentArray(content: unknown, isError = false): ToolCallContent[] {
   if (Array.isArray(content) && content.length > 0) {
-    return content.map((c) => ({
-      type: 'content' as const,
-      content: { type: 'text' as const, text: isError ? wrapCode(c.text) : c.text },
-    }));
+    return content.flatMap((c) => {
+      const text = toolResultContentText(c);
+      return text ? [textToolCallContent(text, isError)] : [];
+    });
   }
   if (typeof content === 'string' && content.length > 0) {
-    return [{ type: 'content' as const, content: { type: 'text' as const, text: isError ? wrapCode(content) : content } }];
+    return [textToolCallContent(content, isError)];
+  }
+  if (content !== undefined && content !== null) {
+    return [textToolCallContent(stableJson(content), isError)];
   }
   return [];
+}
+
+function textToolCallContent(text: string, isError: boolean): ToolCallContent {
+  return { type: 'content' as const, content: { type: 'text' as const, text: isError ? wrapCode(text) : text } };
+}
+
+function toolResultContentText(content: unknown): string | null {
+  if (typeof content === 'string') return content;
+  if (isPlainObject(content)) {
+    if (content.type === 'text' && typeof content.text === 'string') return content.text;
+    return stableJson(content);
+  }
+  if (content === undefined || content === null) return null;
+  return stableJson(content);
+}
+
+function toolResultRawOutput(content: unknown, isError: boolean): Record<string, unknown> {
+  return safeJson({ content, is_error: isError }) ?? { content: stableJson(content), is_error: isError };
+}
+
+function toolResultTerminalOutput(
+  terminalId: string,
+  content: unknown,
+  isError: boolean,
+): { terminal_output: { terminal_id: string; data: string }; terminal_exit: { terminal_id: string; exit_code: number } } {
+  const parsed = parseToolResultPayload(content);
+  return {
+    terminal_output: { terminal_id: terminalId, data: parsed.output },
+    terminal_exit: { terminal_id: terminalId, exit_code: parsed.exitCode ?? (isError ? 1 : 0) },
+  };
+}
+
+function parseToolResultPayload(content: unknown): { output: string; exitCode?: number } {
+  if (typeof content === 'string') {
+    try {
+      const parsed = JSON.parse(content) as unknown;
+      if (isPlainObject(parsed)) {
+        return {
+          output:
+            asString(parsed.output) ??
+            asString(parsed.diff) ??
+            asString(parsed.error) ??
+            asString(parsed.stderr) ??
+            stableJson(parsed),
+          exitCode: asNumber(parsed.exitCode) ?? asNumber(parsed.exit_code),
+        };
+      }
+      return { output: toolResultContentText(parsed) ?? '' };
+    } catch {
+      return { output: content };
+    }
+  }
+  return { output: toolResultContentText(content) ?? '' };
+}
+
+function toolResultDisplayText(content: unknown): string | null {
+  if (typeof content === 'string') return displayTextFromString(content);
+  if (Array.isArray(content)) {
+    const text = content.map(toolResultContentText).filter((t): t is string => Boolean(t)).join('\n');
+    return text.trim() ? text : null;
+  }
+  return toolResultContentText(content);
+}
+
+function displayTextFromString(content: string): string | null {
+  if (!content.trim()) return null;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (isPlainObject(parsed)) {
+      const direct = asString(parsed.output) ?? asString(parsed.diff) ?? asString(parsed.error) ?? asString(parsed.stderr);
+      if (direct !== undefined) return direct.length > 0 ? direct : null;
+    }
+    return toolResultContentText(parsed);
+  } catch {
+    return content;
+  }
+}
+
+function formatToolResultMessage(text: string, isError: boolean): string {
+  if (text.startsWith('```')) return `**${isError ? 'Tool error' : 'Tool output'}**\n${text}`;
+  return `**${isError ? 'Tool error' : 'Tool output'}**\n\`\`\`text\n${text}\n\`\`\``;
 }
 
 function wrapCode(t: string): string {
@@ -150,6 +268,14 @@ function safeJson(x: unknown): { [k: string]: unknown } | undefined {
 
 function isPlainObject(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+function stableJson(x: unknown): string {
+  try {
+    return JSON.stringify(x, null, 2);
+  } catch {
+    return String(x);
+  }
 }
 
 function asString(v: unknown): string | undefined {
@@ -189,6 +315,81 @@ const TOOL_KIND_MAP: Record<string, ToolKind> = {
   oracle: 'think',
   skill: 'think',
 };
+
+const MAX_TITLE_LEN = 120;
+
+export function isTerminalOutputTool(name: string | undefined): boolean {
+  return name === 'Bash';
+}
+
+function truncate(s: string, max: number = MAX_TITLE_LEN): string {
+  const collapsed = s.replace(/\s+/g, ' ').trim();
+  return collapsed.length <= max ? collapsed : collapsed.slice(0, max - 1) + '…';
+}
+
+export function formatToolTitle(name: string | undefined, input: Record<string, unknown>): string {
+  if (!name) return 'Tool';
+  switch (name) {
+    case 'Bash': {
+      const cmd = asString(input.cmd) ?? asString(input.command);
+      return cmd ? truncate(`\`${cmd}\``) : 'Bash';
+    }
+    case 'Read':
+    case 'view_image': {
+      const p = asString(input.path) ?? asString(input.file_path);
+      return p ? truncate(`Read ${p}`) : name;
+    }
+    case 'edit_file':
+    case 'Edit': {
+      const p = asString(input.path) ?? asString(input.file_path);
+      return p ? truncate(`Edit ${p}`) : name;
+    }
+    case 'create_file':
+    case 'Write': {
+      const p = asString(input.path) ?? asString(input.file_path);
+      return p ? truncate(`Create ${p}`) : name;
+    }
+    case 'finder':
+    case 'Grep':
+    case 'Glob': {
+      const q = asString(input.query) ?? asString(input.pattern) ?? asString(input.path);
+      return q ? truncate(`Search ${q}`) : name;
+    }
+    case 'read_web_page':
+    case 'WebFetch': {
+      const url = asString(input.url);
+      return url ? truncate(`Fetch ${url}`) : name;
+    }
+    case 'web_search':
+    case 'WebSearch': {
+      const q = asString(input.query) ?? asString(input.q);
+      return q ? truncate(`Web search ${q}`) : name;
+    }
+    case 'oracle': {
+      const q = asString(input.question) ?? asString(input.prompt);
+      return q ? truncate(`Oracle: ${q}`) : name;
+    }
+    case 'Task': {
+      const desc = asString(input.description) ?? asString(input.subagent_type);
+      return desc ? truncate(`Task: ${desc}`) : name;
+    }
+    case 'librarian':
+    case 'skill':
+    case 'handoff':
+      return name;
+    case 'find_thread':
+    case 'read_thread': {
+      const q = asString(input.threadId) ?? asString(input.query);
+      return q ? truncate(`${name === 'find_thread' ? 'Find' : 'Read'} thread ${q}`) : name;
+    }
+    case 'read_mcp_resource': {
+      const uri = asString(input.uri) ?? asString(input.resource);
+      return uri ? truncate(`MCP read ${uri}`) : name;
+    }
+    default:
+      return name;
+  }
+}
 
 export function inferToolKind(name: string | undefined): ToolKind {
   if (!name) return 'other';

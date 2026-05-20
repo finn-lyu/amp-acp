@@ -1,5 +1,43 @@
 import { describe, it, expect } from 'bun:test';
-import { inferToolKind, extractToolLocations, extractDiffContent, toAcpNotifications } from './to-acp.js';
+import { inferToolKind, extractToolLocations, extractDiffContent, formatToolTitle, toAcpNotifications } from './to-acp.js';
+
+describe('formatToolTitle', () => {
+  it('wraps Bash commands in backticks', () => {
+    expect(formatToolTitle('Bash', { cmd: 'ls -la' })).toBe('`ls -la`');
+    expect(formatToolTitle('Bash', { command: 'git status' })).toBe('`git status`');
+    expect(formatToolTitle('Bash', {})).toBe('Bash');
+  });
+
+  it('prefixes file-targeting tools with a verb + path', () => {
+    expect(formatToolTitle('Read', { path: '/x.ts' })).toBe('Read /x.ts');
+    expect(formatToolTitle('edit_file', { path: '/a.ts' })).toBe('Edit /a.ts');
+    expect(formatToolTitle('create_file', { path: '/n.ts' })).toBe('Create /n.ts');
+    expect(formatToolTitle('Write', { file_path: '/n.ts' })).toBe('Create /n.ts');
+  });
+
+  it('formats search/fetch/web tools with their query / url', () => {
+    expect(formatToolTitle('finder', { query: 'TODO' })).toBe('Search TODO');
+    expect(formatToolTitle('read_web_page', { url: 'https://x' })).toBe('Fetch https://x');
+    expect(formatToolTitle('web_search', { query: 'how to bun' })).toBe('Web search how to bun');
+  });
+
+  it('truncates long titles with an ellipsis', () => {
+    const long = 'a'.repeat(500);
+    const title = formatToolTitle('Bash', { cmd: long });
+    expect(title.length).toBeLessThanOrEqual(120);
+    expect(title.endsWith('…')).toBe(true);
+  });
+
+  it('collapses multi-line bash into a single line', () => {
+    const title = formatToolTitle('Bash', { cmd: 'one\n\ntwo\n  three' });
+    expect(title).toBe('`one two three`');
+  });
+
+  it('falls back to the bare tool name for unknown / empty tools', () => {
+    expect(formatToolTitle('mystery_mcp_tool', { x: 1 })).toBe('mystery_mcp_tool');
+    expect(formatToolTitle(undefined, {})).toBe('Tool');
+  });
+});
 
 describe('inferToolKind', () => {
   it('maps Amp built-in tools to ACP kinds', () => {
@@ -104,7 +142,7 @@ describe('toAcpNotifications: full integration of kind/locations/diff', () => {
     expect(out[0].update).toMatchObject({
       sessionUpdate: 'tool_call',
       toolCallId: 't1',
-      title: 'edit_file',
+      title: 'Edit /repo/file.ts',
       kind: 'edit',
       locations: [{ path: '/repo/file.ts' }],
       content: [{ type: 'diff', path: '/repo/file.ts', oldText: 'foo', newText: 'bar' }],
