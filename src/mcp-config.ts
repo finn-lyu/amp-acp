@@ -19,7 +19,7 @@ export function convertAcpMcpServersToAmpConfig(mcpServers: McpServer[] | undefi
         url: server.url,
         headers: Object.keys(headers).length > 0 ? headers : undefined,
       };
-    } else {
+    } else if (!('type' in server)) {
       const env = server.env.length > 0
         ? Object.fromEntries(server.env.map((e) => [e.name, e.value]))
         : undefined;
@@ -28,6 +28,8 @@ export function convertAcpMcpServersToAmpConfig(mcpServers: McpServer[] | undefi
         args: server.args,
         env,
       };
+    } else {
+      console.warn(`[amp-acp] Ignoring ACP-transport MCP server "${server.name}" because Amp does not support it yet`);
     }
   }
 

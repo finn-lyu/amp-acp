@@ -32,6 +32,47 @@ describe('Amp mode advertisement', () => {
     expect(response.modes?.currentModeId).toBe('smart');
     expect(response.modes?.availableModes?.map((m) => m.id)).toEqual(['smart', 'rush', 'deep']);
     expect(response.modes?.availableModes?.map((m) => m.name)).toEqual(['Smart', 'Rush', 'Deep']);
+    expect(response.configOptions?.[0]).toMatchObject({
+      id: 'thinking',
+      name: 'Thinking',
+      type: 'select',
+      category: 'thought_level',
+      currentValue: 'on',
+      options: [
+        { value: 'on', name: 'Thinking on' },
+        { value: 'off', name: 'Thinking off' },
+      ],
+    });
+  });
+});
+
+describe('thinking config option', () => {
+  it('switches thinking on/off through session config options', async () => {
+    const conn = makeConnection();
+    const session = await conn.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    const off = await conn.setSessionConfigOption({
+      sessionId: session.sessionId,
+      configId: 'thinking',
+      value: 'off',
+    });
+    expect(off.configOptions[0]).toMatchObject({ id: 'thinking', currentValue: 'off' });
+
+    const on = await conn.setSessionConfigOption({
+      sessionId: session.sessionId,
+      configId: 'thinking',
+      value: 'on',
+    });
+    expect(on.configOptions[0]).toMatchObject({ id: 'thinking', currentValue: 'on' });
+  });
+
+  it('rejects unknown thinking values', async () => {
+    const conn = makeConnection();
+    const session = await conn.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    await expect(
+      conn.setSessionConfigOption({ sessionId: session.sessionId, configId: 'thinking', value: 'maybe' }),
+    ).rejects.toThrow(/Unknown thinking option/);
   });
 });
 
@@ -165,7 +206,16 @@ describe('Amp option environment flags', () => {
       buildAmpOptions(
         { cwd: '/tmp', mode: 'deep', mcpConfig: {}, threadId: null },
         { AMP_ACP_THINKING: 'false' },
-      ).thinking,
+    ).thinking,
     ).toBe(false);
+  });
+
+  it('lets session config override the env thinking default', () => {
+    expect(
+      buildAmpOptions(
+        { cwd: '/tmp', mode: 'deep', mcpConfig: {}, threadId: null, thinking: true },
+        { AMP_ACP_THINKING: 'false' },
+      ).thinking,
+    ).toBe(true);
   });
 });

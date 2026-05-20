@@ -15,6 +15,9 @@ import {
   type CancelNotification,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
+  type SessionConfigOption,
   type SetSessionModelRequest,
   type SetSessionModelResponse,
   type ReadTextFileRequest,
@@ -55,6 +58,9 @@ const PACKAGE_VERSION: string = packageJson.version;
 
 const AMP_MODES = ['smart', 'rush', 'deep'] as const;
 export type AmpMode = (typeof AMP_MODES)[number];
+const THINKING_CONFIG_ID = 'thinking';
+const THINKING_ON_VALUE = 'on';
+const THINKING_OFF_VALUE = 'off';
 
 const AMP_ACP_THINKING_ENV = 'AMP_ACP_THINKING';
 const AMP_ACP_DANGEROUSLY_ALLOW_ALL_ENV = 'AMP_ACP_DANGEROUSLY_ALLOW_ALL';
@@ -127,6 +133,7 @@ interface SessionState {
   cancelled: boolean;
   active: boolean;
   mode: AmpMode;
+  thinking: boolean;
   mcpConfig: AmpMcpConfig;
   cwd: string;
   lastUsage: UsageSnapshot | null;
@@ -139,6 +146,7 @@ export interface AmpOptionsInput {
   mode: AmpMode;
   mcpConfig: AmpMcpConfig;
   threadId: string | null;
+  thinking?: boolean;
   permissionDelegate?: PermissionDelegateConfig | null;
 }
 
@@ -163,6 +171,25 @@ function buildModeState(currentModeId: AmpMode): NonNullable<NewSessionResponse[
       { id: 'deep', name: 'Deep', description: 'Extended reasoning for complex tasks' },
     ],
   };
+}
+
+function buildThinkingConfigOption(thinking: boolean): SessionConfigOption {
+  return {
+    id: THINKING_CONFIG_ID,
+    name: 'Thinking',
+    description: 'Show Amp thinking output in the transcript',
+    type: 'select',
+    category: 'thought_level',
+    currentValue: thinking ? THINKING_ON_VALUE : THINKING_OFF_VALUE,
+    options: [
+      { value: THINKING_ON_VALUE, name: 'Thinking on' },
+      { value: THINKING_OFF_VALUE, name: 'Thinking off' },
+    ],
+  };
+}
+
+function buildConfigOptions(s: Pick<SessionState, 'thinking'>): SessionConfigOption[] {
+  return [buildThinkingConfigOption(s.thinking)];
 }
 
 export class AmpAcpAgent implements Agent {
@@ -227,6 +254,7 @@ export class AmpAcpAgent implements Agent {
     const sessionId = `S-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     const mcpConfig = convertAcpMcpServersToAmpConfig(params.mcpServers);
+    const thinking = readBooleanEnv(AMP_ACP_THINKING_ENV, true);
 
     this.sessions.set(sessionId, {
       threadId: null,
@@ -234,6 +262,7 @@ export class AmpAcpAgent implements Agent {
       cancelled: false,
       active: false,
       mode: 'smart',
+      thinking,
       mcpConfig,
       cwd: params.cwd || process.cwd(),
       lastUsage: null,
@@ -244,6 +273,7 @@ export class AmpAcpAgent implements Agent {
     const result: NewSessionResponse = {
       sessionId,
       modes: buildModeState('smart'),
+      configOptions: [buildThinkingConfigOption(thinking)],
     };
 
     setImmediate(async () => {
@@ -300,6 +330,7 @@ export class AmpAcpAgent implements Agent {
       mode: s.mode,
       mcpConfig: s.mcpConfig,
       threadId: s.threadId,
+      thinking: s.thinking,
       permissionDelegate,
     });
 
@@ -432,6 +463,29 @@ export class AmpAcpAgent implements Agent {
     return {};
   }
 
+  async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+    const s = this.sessions.get(params.sessionId);
+    if (!s) throw new RequestError(-32602, `Session not found: ${params.sessionId}`);
+    if (params.configId !== THINKING_CONFIG_ID) {
+      throw new RequestError(-32602, `Unknown config option: ${params.configId}`);
+    }
+    const value = readConfigOptionValue(params);
+    if (value !== THINKING_ON_VALUE && value !== THINKING_OFF_VALUE) {
+      throw new RequestError(-32602, `Unknown thinking option: ${String(value)}`);
+    }
+    s.thinking = value === THINKING_ON_VALUE;
+    const configOptions = buildConfigOptions(s);
+    try {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: 'config_option_update', configOptions },
+      });
+    } catch (e) {
+      console.error('[acp] failed to send config_option_update', e);
+    }
+    return { configOptions };
+  }
+
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const entry = lookupSession(this.storePaths, params.sessionId);
     if (!entry) {
@@ -446,6 +500,7 @@ export class AmpAcpAgent implements Agent {
       cancelled: false,
       active: false,
       mode,
+      thinking: readBooleanEnv(AMP_ACP_THINKING_ENV, true),
       mcpConfig,
       cwd: params.cwd || process.cwd(),
       lastUsage,
@@ -456,7 +511,8 @@ export class AmpAcpAgent implements Agent {
     recordSession(this.storePaths, params.sessionId, { threadId: entry.threadId, mode });
     await this.replaySessionLog(params.sessionId);
     await this.sendAvailableCommandsUpdate(params.sessionId);
-    return { modes: buildModeState(mode) };
+    const s = this.sessions.get(params.sessionId);
+    return { modes: buildModeState(mode), ...(s ? { configOptions: buildConfigOptions(s) } : {}) };
   }
 
   private persistSessionEntry(sessionId: string, s: SessionState): void {
@@ -508,6 +564,7 @@ export class AmpAcpAgent implements Agent {
             { name: 'export', description: 'Export the current Amp thread as markdown' },
             { name: 'usage', description: 'Show token usage for the latest turn' },
             { name: 'permissions', description: 'Show amp-acp permission delegate status' },
+            { name: 'thinking', description: 'Show or set thinking output: /thinking on|off' },
             {
               name: 'resume',
               description: 'Switch this session to an existing Amp thread by ID',
@@ -554,6 +611,10 @@ export class AmpAcpAgent implements Agent {
         await emit(await this.formatPermissionStatus(sessionId, s));
         return;
       }
+      case 'thinking': {
+        await emit(await this.handleThinkingCommand(sessionId, s, slash.arg));
+        return;
+      }
       case 'resume': {
         const arg = slash.arg;
         if (!arg) {
@@ -576,6 +637,26 @@ export class AmpAcpAgent implements Agent {
     }
   }
 
+  private async handleThinkingCommand(sessionId: string, s: SessionState, arg: string): Promise<string> {
+    const normalized = arg.trim().toLowerCase();
+    if (!normalized) {
+      return `Thinking is ${s.thinking ? 'on' : 'off'}. Use \`/thinking on\` or \`/thinking off\` to change it.`;
+    }
+    if (normalized !== THINKING_ON_VALUE && normalized !== THINKING_OFF_VALUE) {
+      return 'Usage: `/thinking on` or `/thinking off`';
+    }
+    s.thinking = normalized === THINKING_ON_VALUE;
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: 'config_option_update', configOptions: buildConfigOptions(s) },
+      });
+    } catch (e) {
+      console.error('[acp] failed to send config_option_update', e);
+    }
+    return `Thinking ${s.thinking ? 'on' : 'off'}.`;
+  }
+
   private async formatPermissionStatus(sessionId: string, s: SessionState): Promise<string> {
     const promptsEnabled = readBooleanEnv(AMP_ACP_PERMISSION_PROMPTS_ENV, true);
     const lines = [
@@ -590,6 +671,7 @@ export class AmpAcpAgent implements Agent {
         mode: s.mode,
         mcpConfig: s.mcpConfig,
         threadId: s.threadId,
+        thinking: s.thinking,
         permissionDelegate: null,
       });
       lines.push(`- Delegated prompts: disabled`);
@@ -603,6 +685,7 @@ export class AmpAcpAgent implements Agent {
         mode: s.mode,
         mcpConfig: s.mcpConfig,
         threadId: s.threadId,
+        thinking: s.thinking,
         permissionDelegate: delegate,
       });
       lines.push('- Delegated prompts: enabled');
@@ -876,14 +959,14 @@ function readExecExitCode(error: ExecFileException): number | null {
 }
 
 export function buildAmpOptions(
-  { cwd, mode, mcpConfig, threadId, permissionDelegate }: AmpOptionsInput,
+  { cwd, mode, mcpConfig, threadId, thinking, permissionDelegate }: AmpOptionsInput,
   env: Record<string, string | undefined> = process.env,
 ): AmpOptions {
   const options: AmpOptions = {
     cwd,
     env: { TERM: 'dumb' },
     mode,
-    thinking: readBooleanEnv(AMP_ACP_THINKING_ENV, true, env),
+    thinking: thinking ?? readBooleanEnv(AMP_ACP_THINKING_ENV, true, env),
     ...(Object.keys(mcpConfig).length > 0 ? { mcpConfig } : {}),
     ...(threadId ? { continue: threadId } : {}),
   };
@@ -933,8 +1016,18 @@ export function detectAdapterSlashCommand(text: string): { command: string; arg:
   // /init is intentionally NOT an adapter command — parsePrompt expands it into a
   // regular prompt the model handles. Only commands that should bypass Amp belong
   // here.
-  if (command !== 'export' && command !== 'usage' && command !== 'resume' && command !== 'permissions') return null;
+  if (
+    command !== 'export' &&
+    command !== 'usage' &&
+    command !== 'resume' &&
+    command !== 'permissions' &&
+    command !== 'thinking'
+  ) return null;
   return { command, arg: (match[2] ?? '').trim() };
+}
+
+function readConfigOptionValue(params: SetSessionConfigOptionRequest): string | boolean {
+  return 'value' in params ? params.value : '';
 }
 
 export function formatUsage(usage: UsageSnapshot | null, ampUsage?: AmpUsageCommandResult | null): string {

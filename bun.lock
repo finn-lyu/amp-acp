@@ -4,7 +4,7 @@
     "": {
       "name": "amp-acp",
       "dependencies": {
-        "@agentclientprotocol/sdk": "0.4.8",
+        "@agentclientprotocol/sdk": "0.22.1",
         "@ampcode/cli": "0.0.1779181266-g25c2b3",
         "@ampcode/sdk": "0.1.0-20260519092322-g25c2b32",
       },
@@ -18,7 +18,7 @@
     "@ampcode/cli",
   ],
   "packages": {
-    "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@0.4.8", "", { "dependencies": { "zod": "^3.0.0" } }, "sha512-2hN2CMMWtYVHrUeuapwLu66S2wwOPhq+bLqAryl1cQjKjL5Mzkfq+oxFYFvGdPvBoKpJSxM2pIIQiUH8tGZ3rg=="],
+    "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@0.22.1", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-DfqXtl/8gO9NImq094MTaCXEU2vkhh6v7q/kT+9UjZxUqj8hYaya2OjLVIqn16MzNHcXEpShTR2RIauLSYeDQQ=="],
 
     "@ampcode/cli": ["@ampcode/cli@0.0.1779181266-g25c2b3", "", { "optionalDependencies": { "@ampcode/cli-darwin-arm64": "0.0.1779181266-g25c2b3", "@ampcode/cli-darwin-x64": "0.0.1779181266-g25c2b3", "@ampcode/cli-linux-arm64": "0.0.1779181266-g25c2b3", "@ampcode/cli-linux-x64": "0.0.1779181266-g25c2b3", "@ampcode/cli-win32-x64": "0.0.1779181266-g25c2b3" }, "bin": { "amp": "bin/amp.exe" } }, "sha512-IOaO/5hMQdLMtc1F2M75b/UrGkIWWOvrXG1qCCss1NwkxMe/riwt8VVDzV2LbZFVTjAj8rbEKddm4DWa5uGE+Q=="],
 

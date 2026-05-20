@@ -51,11 +51,12 @@ function makeConnection(storePaths: SessionStorePaths) {
 }
 
 describe('detectAdapterSlashCommand', () => {
-  it('matches /export, /usage, /resume', () => {
+  it('matches /export, /usage, /resume, /permissions, /thinking', () => {
     expect(detectAdapterSlashCommand('/export')).toEqual({ command: 'export', arg: '' });
     expect(detectAdapterSlashCommand('/usage')).toEqual({ command: 'usage', arg: '' });
     expect(detectAdapterSlashCommand('/resume T-abc')).toEqual({ command: 'resume', arg: 'T-abc' });
     expect(detectAdapterSlashCommand('/permissions')).toEqual({ command: 'permissions', arg: '' });
+    expect(detectAdapterSlashCommand('/thinking off')).toEqual({ command: 'thinking', arg: 'off' });
   });
 
   it('does NOT match /init (handled by parsePrompt expansion)', () => {
@@ -266,7 +267,34 @@ describe('available_commands_update advertises the adapter slash commands', () =
       .flatMap((n) =>
         (n.update as { availableCommands: { name: string }[] }).availableCommands.map((c) => c.name),
       );
-    expect(cmds).toEqual(expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions']));
+    expect(cmds).toEqual(expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions', 'thinking']));
+  });
+});
+
+describe('/thinking slash command', () => {
+  let store: { paths: SessionStorePaths; cleanup: () => void };
+  beforeEach(() => { store = tempStore(); });
+  afterEach(() => { store.cleanup(); });
+
+  it('reports and updates thinking state', async () => {
+    const { conn, testClient } = makeConnection(store.paths);
+    const session = await conn.newSession({ cwd: '/tmp', mcpServers: [] });
+    testClient.notifications = [];
+
+    await conn.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/thinking' }] });
+    await conn.prompt({ sessionId: session.sessionId, prompt: [{ type: 'text', text: '/thinking off' }] });
+
+    const text = testClient.notifications
+      .filter((n) => n.update.sessionUpdate === 'agent_message_chunk')
+      .map((n) => (n.update as { content: { text: string } }).content.text)
+      .join('\n');
+    expect(text).toContain('Thinking is on');
+    expect(text).toContain('Thinking off.');
+
+    const configUpdates = testClient.notifications
+      .filter((n) => n.update.sessionUpdate === 'config_option_update')
+      .map((n) => (n.update as { configOptions: Array<{ id: string; currentValue: string }> }).configOptions[0]);
+    expect(configUpdates.at(-1)).toMatchObject({ id: 'thinking', currentValue: 'off' });
   });
 });
 

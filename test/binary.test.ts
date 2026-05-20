@@ -227,7 +227,7 @@ describe('Binary integration tests', () => {
     const params = notification.params as Record<string, unknown>;
     const update = params.update as { availableCommands?: Array<{ name: string }> };
     expect(update.availableCommands?.map((command) => command.name)).toEqual(
-      expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions']),
+      expect.arrayContaining(['init', 'export', 'usage', 'resume', 'permissions', 'thinking']),
     );
   });
 });
