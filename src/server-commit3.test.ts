@@ -293,7 +293,11 @@ describe('/thinking slash command', () => {
 
     const configUpdates = testClient.notifications
       .filter((n) => n.update.sessionUpdate === 'config_option_update')
-      .map((n) => (n.update as { configOptions: Array<{ id: string; currentValue: string }> }).configOptions[0]);
+      .map((n) =>
+        (n.update as { configOptions: Array<{ id: string; currentValue: string }> }).configOptions.find(
+          (option) => option.id === 'thinking',
+        ),
+      );
     expect(configUpdates.at(-1)).toMatchObject({ id: 'thinking', currentValue: 'off' });
   });
 });

@@ -58,6 +58,7 @@ const PACKAGE_VERSION: string = packageJson.version;
 
 const AMP_MODES = ['smart', 'rush', 'deep'] as const;
 export type AmpMode = (typeof AMP_MODES)[number];
+const MODE_CONFIG_ID = 'mode';
 const THINKING_CONFIG_ID = 'thinking';
 const THINKING_ON_VALUE = 'on';
 const THINKING_OFF_VALUE = 'off';
@@ -173,13 +174,29 @@ function buildModeState(currentModeId: AmpMode): NonNullable<NewSessionResponse[
   };
 }
 
+function buildModeConfigOption(mode: AmpMode): SessionConfigOption {
+  return {
+    id: MODE_CONFIG_ID,
+    name: 'Mode',
+    description: 'Choose the Amp mode for this session',
+    type: 'select',
+    category: 'mode',
+    currentValue: mode,
+    options: [
+      { value: 'smart', name: 'Smart' },
+      { value: 'rush', name: 'Rush' },
+      { value: 'deep', name: 'Deep' },
+    ],
+  };
+}
+
 function buildThinkingConfigOption(thinking: boolean): SessionConfigOption {
   return {
     id: THINKING_CONFIG_ID,
     name: 'Thinking',
-    description: 'Show Amp thinking output in the transcript',
+    description: 'Turn Amp thinking on or off',
     type: 'select',
-    category: 'thought_level',
+    category: 'thinking',
     currentValue: thinking ? THINKING_ON_VALUE : THINKING_OFF_VALUE,
     options: [
       { value: THINKING_ON_VALUE, name: 'Thinking on' },
@@ -188,8 +205,8 @@ function buildThinkingConfigOption(thinking: boolean): SessionConfigOption {
   };
 }
 
-function buildConfigOptions(s: Pick<SessionState, 'thinking'>): SessionConfigOption[] {
-  return [buildThinkingConfigOption(s.thinking)];
+function buildConfigOptions(s: Pick<SessionState, 'mode' | 'thinking'>): SessionConfigOption[] {
+  return [buildModeConfigOption(s.mode), buildThinkingConfigOption(s.thinking)];
 }
 
 export class AmpAcpAgent implements Agent {
@@ -273,7 +290,7 @@ export class AmpAcpAgent implements Agent {
     const result: NewSessionResponse = {
       sessionId,
       modes: buildModeState('smart'),
-      configOptions: [buildThinkingConfigOption(thinking)],
+      configOptions: buildConfigOptions({ mode: 'smart', thinking }),
     };
 
     setImmediate(async () => {
@@ -450,40 +467,59 @@ export class AmpAcpAgent implements Agent {
     if (!isAmpMode(params.modeId)) {
       throw new RequestError(-32602, `Unknown mode: ${params.modeId}`);
     }
-    s.mode = params.modeId;
-    this.persistSessionEntry(params.sessionId, s);
-    try {
-      await this.client.sessionUpdate({
-        sessionId: params.sessionId,
-        update: { sessionUpdate: 'current_mode_update', currentModeId: params.modeId },
-      });
-    } catch (e) {
-      console.error('[acp] failed to send current_mode_update', e);
-    }
+    await this.updateSessionMode(params.sessionId, s, params.modeId);
     return {};
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     const s = this.sessions.get(params.sessionId);
     if (!s) throw new RequestError(-32602, `Session not found: ${params.sessionId}`);
+    const value = readConfigOptionValue(params);
+
+    if (params.configId === MODE_CONFIG_ID) {
+      if (typeof value !== 'string' || !isAmpMode(value)) {
+        throw new RequestError(-32602, `Unknown mode: ${String(value)}`);
+      }
+      await this.updateSessionMode(params.sessionId, s, value);
+      const configOptions = buildConfigOptions(s);
+      await this.sendConfigOptionsUpdate(params.sessionId, configOptions);
+      return { configOptions };
+    }
+
     if (params.configId !== THINKING_CONFIG_ID) {
       throw new RequestError(-32602, `Unknown config option: ${params.configId}`);
     }
-    const value = readConfigOptionValue(params);
     if (value !== THINKING_ON_VALUE && value !== THINKING_OFF_VALUE) {
       throw new RequestError(-32602, `Unknown thinking option: ${String(value)}`);
     }
     s.thinking = value === THINKING_ON_VALUE;
     const configOptions = buildConfigOptions(s);
+    await this.sendConfigOptionsUpdate(params.sessionId, configOptions);
+    return { configOptions };
+  }
+
+  private async updateSessionMode(sessionId: string, s: SessionState, mode: AmpMode): Promise<void> {
+    s.mode = mode;
+    this.persistSessionEntry(sessionId, s);
     try {
       await this.client.sessionUpdate({
-        sessionId: params.sessionId,
+        sessionId,
+        update: { sessionUpdate: 'current_mode_update', currentModeId: mode },
+      });
+    } catch (e) {
+      console.error('[acp] failed to send current_mode_update', e);
+    }
+  }
+
+  private async sendConfigOptionsUpdate(sessionId: string, configOptions: SessionConfigOption[]): Promise<void> {
+    try {
+      await this.client.sessionUpdate({
+        sessionId,
         update: { sessionUpdate: 'config_option_update', configOptions },
       });
     } catch (e) {
       console.error('[acp] failed to send config_option_update', e);
     }
-    return { configOptions };
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -564,7 +600,7 @@ export class AmpAcpAgent implements Agent {
             { name: 'export', description: 'Export the current Amp thread as markdown' },
             { name: 'usage', description: 'Show token usage for the latest turn' },
             { name: 'permissions', description: 'Show amp-acp permission delegate status' },
-            { name: 'thinking', description: 'Show or set thinking output: /thinking on|off' },
+            { name: 'thinking', description: 'Turn thinking on/off' },
             {
               name: 'resume',
               description: 'Switch this session to an existing Amp thread by ID',
@@ -646,14 +682,7 @@ export class AmpAcpAgent implements Agent {
       return 'Usage: `/thinking on` or `/thinking off`';
     }
     s.thinking = normalized === THINKING_ON_VALUE;
-    try {
-      await this.client.sessionUpdate({
-        sessionId,
-        update: { sessionUpdate: 'config_option_update', configOptions: buildConfigOptions(s) },
-      });
-    } catch (e) {
-      console.error('[acp] failed to send config_option_update', e);
-    }
+    await this.sendConfigOptionsUpdate(sessionId, buildConfigOptions(s));
     return `Thinking ${s.thinking ? 'on' : 'off'}.`;
   }
 

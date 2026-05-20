@@ -32,11 +32,23 @@ describe('Amp mode advertisement', () => {
     expect(response.modes?.currentModeId).toBe('smart');
     expect(response.modes?.availableModes?.map((m) => m.id)).toEqual(['smart', 'rush', 'deep']);
     expect(response.modes?.availableModes?.map((m) => m.name)).toEqual(['Smart', 'Rush', 'Deep']);
-    expect(response.configOptions?.[0]).toMatchObject({
+    expect(response.configOptions?.find((option) => option.id === 'mode')).toMatchObject({
+      id: 'mode',
+      name: 'Mode',
+      type: 'select',
+      category: 'mode',
+      currentValue: 'smart',
+      options: [
+        { value: 'smart', name: 'Smart' },
+        { value: 'rush', name: 'Rush' },
+        { value: 'deep', name: 'Deep' },
+      ],
+    });
+    expect(response.configOptions?.find((option) => option.id === 'thinking')).toMatchObject({
       id: 'thinking',
       name: 'Thinking',
       type: 'select',
-      category: 'thought_level',
+      category: 'thinking',
       currentValue: 'on',
       options: [
         { value: 'on', name: 'Thinking on' },
@@ -56,14 +68,36 @@ describe('thinking config option', () => {
       configId: 'thinking',
       value: 'off',
     });
-    expect(off.configOptions[0]).toMatchObject({ id: 'thinking', currentValue: 'off' });
+    expect(off.configOptions.find((option) => option.id === 'thinking')).toMatchObject({
+      id: 'thinking',
+      currentValue: 'off',
+    });
 
     const on = await conn.setSessionConfigOption({
       sessionId: session.sessionId,
       configId: 'thinking',
       value: 'on',
     });
-    expect(on.configOptions[0]).toMatchObject({ id: 'thinking', currentValue: 'on' });
+    expect(on.configOptions.find((option) => option.id === 'thinking')).toMatchObject({
+      id: 'thinking',
+      currentValue: 'on',
+    });
+  });
+
+  it('switches Amp mode through session config options', async () => {
+    const conn = makeConnection();
+    const session = await conn.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    const response = await conn.setSessionConfigOption({
+      sessionId: session.sessionId,
+      configId: 'mode',
+      value: 'rush',
+    });
+
+    expect(response.configOptions.find((option) => option.id === 'mode')).toMatchObject({
+      id: 'mode',
+      currentValue: 'rush',
+    });
   });
 
   it('rejects unknown thinking values', async () => {
