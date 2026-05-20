@@ -1,6 +1,6 @@
 # ACP adapter for Amp
 
-[![CI](https://github.com/finnlyu/amp-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/finnlyu/amp-acp/actions/workflows/ci.yml)
+[![CI](https://github.com/finn-lyu/amp-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/finn-lyu/amp-acp/actions/workflows/ci.yml)
 
 Use [Amp](https://ampcode.com) from [ACP](https://agentclientprotocol.com/)-compatible clients such as [Zed](https://zed.dev).
 

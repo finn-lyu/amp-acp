@@ -14,7 +14,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/finnlyu/amp-acp"
+    "url": "https://github.com/finn-lyu/amp-acp"
   },
   "scripts": {
     "build": "bun build src/index.ts --target=node --outdir=dist --entry-naming=[dir]/[name].js",
